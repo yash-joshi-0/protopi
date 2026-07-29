@@ -1,0 +1,5 @@
+luma.led_matrix>=1.7.1
+luma.core>=2.4.2
+spidev>=3.6
+RPi.GPIO>=0.7.1
+Pillow>=10.0.0
