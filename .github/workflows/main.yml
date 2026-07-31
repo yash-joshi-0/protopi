@@ -1,0 +1,29 @@
+- name: Commit Comment
+  # You may pin to the exact commit or the version.
+  # uses: peter-evans/commit-comment@f6d60c65d05bb59f750fa51ad3de1d443ba0eb52
+  uses: peter-evans/commit-comment@v4.0.0
+  with:
+    # The GitHub authentication token
+    token: # optional, default is ${{ github.token }}
+    # The full name of the target repository.
+    repository: # optional, default is ${{ github.repository }}
+    # The commit SHA.
+    sha: # optional
+    # Relative path of the file to comment on.
+    path: # optional
+    # Line index in the diff to comment on.
+    position: # optional
+    # The id of the comment to update.
+    comment-id: # optional
+    # The comment body. Cannot be used in conjunction with `body-path`.
+    body: # optional
+    # The path to a file containing the comment body. Cannot be used in conjunction with `body`.
+    body-path: # optional
+    # The mode when updating a comment, "replace" or "append".
+    edit-mode: # optional, default is append
+    # The separator to use when appending to an existing comment. (`newline`, `space`, `none`)
+    append-separator: # optional, default is newline
+    # A comma or newline separated list of reactions to add to the comment.
+    reactions: # optional
+    # The mode when updating comment reactions, "replace" or "append".
+    reactions-edit-mode: # optional, default is append
