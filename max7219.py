@@ -375,14 +375,14 @@ class Max7219FaceController:
             transition_duration_ms = self.reaction_transition_duration_ms
 
         self.face_state = FaceState.REACT
-        self.transition_active = True
+        self.transition_active = False
         self.transition_progress = 0.0
-        self.reaction_phase = 0
+        self.reaction_phase = 1
         self.mouth_step = 0
         self.reaction_transition_start = time.monotonic()
         self.reaction_transition_duration_ms = transition_duration_ms
         self.last_mouth_frame = time.monotonic()
-        self.render_face(blink=True, mouth_step=0, transition_progress=0.0)
+        self.render_face(blink=True, mouth_step=0)
 
     # Contract: Prompt the user to calibrate matrix transforms and persist the result.
     def configure_matrices(self) -> None:
@@ -487,51 +487,23 @@ class Max7219FaceController:
                     self.next_blink = time.monotonic() + random.uniform(5, 10)
                     self.render()
             elif self.face_state == FaceState.REACT:
-                if self.transition_active:
-                    elapsed_seconds = time.monotonic() - self.reaction_transition_start
-                    duration_seconds = max(
-                        self.reaction_transition_duration_ms / 1000.0,
-                        0.001,
-                    )
-                    self.transition_progress = min(
-                        elapsed_seconds / duration_seconds,
-                        1.0,
-                    )
-                    self.render_face(
-                        blink=True,
-                        mouth_step=0,
-                        transition_progress=self.transition_progress,
-                    )
+                if self.boop:
+                    if self.reaction_phase == 1:
+                        if time.monotonic() - self.last_mouth_frame > 0.080:
+                            self.last_mouth_frame = time.monotonic()
 
-                    if self.transition_progress >= 1.0:
-                        self.transition_active = False
-                        self.reaction_phase = 1
-                        self.mouth_step = 0
-                        self.last_mouth_frame = time.monotonic()
-                        self.render_face(blink=True, mouth_step=0)
-                elif self.reaction_phase == 0:
-                    self.reaction_phase = 1
+                            if self.mouth_step < 3:
+                                self.mouth_step += 1
+                                self.render_face(blink=True, mouth_step=self.mouth_step)
+                            else:
+                                self.render_face(blink=True, mouth_step=3)
+                else:
+                    self.reaction_phase = 0
                     self.mouth_step = 0
-                    self.last_mouth_frame = time.monotonic()
-                    self.render_face(blink=True, mouth_step=0)
-                elif self.reaction_phase == 1:
-                    if time.monotonic() - self.last_mouth_frame > 0.020:
-                        self.last_mouth_frame = time.monotonic()
-
-                        if self.mouth_step < 4:
-                            self.mouth_step += 1
-                            self.render_face(blink=True, mouth_step=self.mouth_step)
-                        else:
-                            self.reaction_phase = 2
-                            self.reaction_timer = time.monotonic()
-                elif self.reaction_phase == 2:
-                    if time.monotonic() - self.reaction_timer > 0.150:
-                        self.reaction_phase = 0
-                        self.mouth_step = 0
-                        self.face_state = FaceState.IDLE
-                        self.transition_active = False
-                        self.transition_progress = 0.0
-                        self.render()
+                    self.face_state = FaceState.IDLE
+                    self.transition_active = False
+                    self.transition_progress = 0.0
+                    self.render()
 
             time.sleep(0.005)
 
