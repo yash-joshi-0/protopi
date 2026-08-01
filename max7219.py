@@ -11,6 +11,7 @@ from typing import List, Sequence, Tuple
 from luma.core.interface.serial import spi, noop
 from luma.core.render import canvas
 from luma.led_matrix.device import max7219
+import RPi.GPIO as GPIO
 
 # User Values: These may need to be changed based on matrix configuration and layout.
 NUM_MATRICES = 14
@@ -20,6 +21,11 @@ NOSE_LEFT = 6
 NOSE_RIGHT = 7
 EYE_RIGHT_START = 8
 MOUTH_RIGHT_START = 10
+
+# Configuration values: These can be changes to personal preference.
+BUTTON_PIN = 17
+BUTTON_DEBOUNCE_MS = 50
+REACTION_TRANSITION_DURATION_MS = 500
 
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
@@ -79,6 +85,8 @@ class Max7219FaceController:
         self,
         num_matrices: int = NUM_MATRICES,
         config_path: Path | None = None,
+        reaction_transition_duration_ms: int = REACTION_TRANSITION_DURATION_MS,
+        button_debounce_ms: int = BUTTON_DEBOUNCE_MS,
     ) -> None:
         self.num_matrices = num_matrices
         self.config_path = config_path or Path(__file__).resolve().with_name(
@@ -111,6 +119,20 @@ class Max7219FaceController:
         self.mouth_step = 0
         self.reaction_timer = 0.0
         self.last_mouth_frame = 0.0
+        self.boop = False
+        self.button_pin = BUTTON_PIN
+        self.reaction_transition_duration_ms = reaction_transition_duration_ms
+        self.button_debounce_ms = button_debounce_ms
+        self.reaction_transition_start = 0.0
+        self.transition_active = False
+        self.transition_progress = 0.0
+        self._button_raw_state = False
+        self._button_last_change_time = 0.0
+
+        if GPIO is not None:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     # Contract: Load per-matrix transforms from disk and fill any missing entries with defaults.
     def load_matrix_config(self) -> None:
@@ -213,8 +235,40 @@ class Max7219FaceController:
         self.draw_module(NOSE_LEFT, NOSE_FRAME)
         self.draw_module(NOSE_RIGHT, NOSE_FRAME)
 
+    # Contract: Clear the mouth area before drawing the next mouth frame.
+    def clear_mouth_modules(self) -> None:
+        for module_index in range(4):
+            self.clear_module(MOUTH_LEFT_START + module_index)
+
+        for module_index in range(4):
+            self.clear_module(MOUTH_RIGHT_START + module_index)
+
     # Contract: Render the mouth animation for the requested step.
-    def draw_mouth(self, step: int = 0) -> None:
+    def draw_mouth(
+        self,
+        step: int = 0,
+        transition_progress: float | None = None,
+    ) -> None:
+        self.clear_mouth_modules()
+
+        if transition_progress is not None:
+            visible_modules = int(round(max(0.0, min(1.0, transition_progress)) * 8))
+            mouth_sequence = [
+                (MOUTH_LEFT_START + 0, MOUTH_FRAME_4),
+                (MOUTH_LEFT_START + 1, MOUTH_FRAME_3),
+                (MOUTH_LEFT_START + 2, MOUTH_FRAME_2),
+                (MOUTH_LEFT_START + 3, MOUTH_FRAME_1),
+                (MOUTH_RIGHT_START + 0, MOUTH_FRAME_1),
+                (MOUTH_RIGHT_START + 1, MOUTH_FRAME_2),
+                (MOUTH_RIGHT_START + 2, MOUTH_FRAME_3),
+                (MOUTH_RIGHT_START + 3, MOUTH_FRAME_4),
+            ]
+
+            for module_index, bitmap in mouth_sequence[:visible_modules]:
+                self.draw_module(module_index, bitmap)
+
+            return
+
         self.draw_module(MOUTH_LEFT_START + 0, MOUTH_FRAME_4)
         self.draw_module(MOUTH_LEFT_START + 1, MOUTH_FRAME_3)
         self.draw_module(MOUTH_LEFT_START + 2, MOUTH_FRAME_2)
@@ -244,11 +298,16 @@ class Max7219FaceController:
             self.clear_module(MOUTH_RIGHT_START + 2)
 
     # Contract: Render the complete face using the current animation state.
-    def render_face(self, blink: bool = False, mouth_step: int = 0) -> None:
+    def render_face(
+        self,
+        blink: bool = False,
+        mouth_step: int = 0,
+        transition_progress: float | None = None,
+    ) -> None:
         self.clear()
         self.draw_eyes(blink)
         self.draw_nose()
-        self.draw_mouth(mouth_step)
+        self.draw_mouth(mouth_step, transition_progress=transition_progress)
         self.draw_corner_markers()
         self.flush()
 
@@ -257,7 +316,14 @@ class Max7219FaceController:
         if self.face_state == FaceState.BLINK:
             self.render_face(blink=True)
         elif self.face_state == FaceState.REACT:
-            self.render_face(blink=True, mouth_step=self.mouth_step)
+            if self.transition_active:
+                self.render_face(
+                    blink=True,
+                    mouth_step=0,
+                    transition_progress=self.transition_progress,
+                )
+            else:
+                self.render_face(blink=True, mouth_step=self.mouth_step)
         else:
             self.render_face()
 
@@ -271,6 +337,45 @@ class Max7219FaceController:
             self.marker_blink = not self.marker_blink
             self.last_marker_blink = now
             self.redraw()
+
+    # Contract: Read the button input and trigger a reaction when booping begins.
+    def update_boop_state(self) -> None:
+        if GPIO is None:
+            self.boop = False
+            self._button_raw_state = False
+            self._button_last_change_time = time.monotonic()
+            return
+
+        button_state = GPIO.input(self.button_pin)
+        raw_boop = button_state == GPIO.LOW
+        now = time.monotonic()
+
+        if raw_boop != self._button_raw_state:
+            self._button_raw_state = raw_boop
+            self._button_last_change_time = now
+
+        if now - self._button_last_change_time > (self.button_debounce_ms / 1000.0):
+            debounced_boop = self._button_raw_state
+
+            if debounced_boop and not self.boop:
+                self.start_boop_reaction()
+
+            self.boop = debounced_boop
+
+    # Contract: Enter the reaction state and reset the mouth animation sequence.
+    def start_boop_reaction(self, transition_duration_ms: int | None = None) -> None:
+        if transition_duration_ms is None:
+            transition_duration_ms = self.reaction_transition_duration_ms
+
+        self.face_state = FaceState.REACT
+        self.transition_active = True
+        self.transition_progress = 0.0
+        self.reaction_phase = 0
+        self.mouth_step = 0
+        self.reaction_transition_start = time.monotonic()
+        self.reaction_transition_duration_ms = transition_duration_ms
+        self.last_mouth_frame = time.monotonic()
+        self.render_face(blink=True, mouth_step=0, transition_progress=0.0)
 
     # Contract: Prompt the user to calibrate matrix transforms and persist the result.
     def configure_matrices(self) -> None:
@@ -361,6 +466,7 @@ class Max7219FaceController:
 
         while True:
             self.update_marker_blink()
+            self.update_boop_state()
 
             if self.face_state == FaceState.IDLE:
                 if time.monotonic() >= self.next_blink:
@@ -374,7 +480,29 @@ class Max7219FaceController:
                     self.next_blink = time.monotonic() + random.uniform(5, 10)
                     self.render()
             elif self.face_state == FaceState.REACT:
-                if self.reaction_phase == 0:
+                if self.transition_active:
+                    elapsed_seconds = time.monotonic() - self.reaction_transition_start
+                    duration_seconds = max(
+                        self.reaction_transition_duration_ms / 1000.0,
+                        0.001,
+                    )
+                    self.transition_progress = min(
+                        elapsed_seconds / duration_seconds,
+                        1.0,
+                    )
+                    self.render_face(
+                        blink=True,
+                        mouth_step=0,
+                        transition_progress=self.transition_progress,
+                    )
+
+                    if self.transition_progress >= 1.0:
+                        self.transition_active = False
+                        self.reaction_phase = 1
+                        self.mouth_step = 0
+                        self.last_mouth_frame = time.monotonic()
+                        self.render_face(blink=True, mouth_step=0)
+                elif self.reaction_phase == 0:
                     self.reaction_phase = 1
                     self.mouth_step = 0
                     self.last_mouth_frame = time.monotonic()
@@ -394,6 +522,8 @@ class Max7219FaceController:
                         self.reaction_phase = 0
                         self.mouth_step = 0
                         self.face_state = FaceState.IDLE
+                        self.transition_active = False
+                        self.transition_progress = 0.0
                         self.render()
 
             time.sleep(0.005)
