@@ -22,7 +22,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ``` 
-3. Configure matrix rotation with `python testmatrices.py` (This only works for 14 matrix runs currently)
+3. Configure matrix rotation with `python max7219.py` (This only works for 14 matrix runs currently)
 
 ---
 *This is a living document and will be updated with development*
