@@ -26,6 +26,8 @@ MOUTH_RIGHT_START = 10
 BUTTON_PIN = 17
 BUTTON_DEBOUNCE_MS = 50
 REACTION_TRANSITION_DURATION_MS = 500
+BUTTON_ACTIVE_STATE = GPIO.HIGH         # Set this to GPIO.LOW if the button circuit is wired as active-low.
+
 
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
@@ -353,7 +355,7 @@ class Max7219FaceController:
             return
 
         button_state = GPIO.input(self.button_pin)
-        raw_boop = button_state == GPIO.LOW
+        raw_boop = button_state == BUTTON_ACTIVE_STATE
         now = time.monotonic()
 
         if raw_boop != self._button_raw_state:
