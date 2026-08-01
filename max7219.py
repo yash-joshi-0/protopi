@@ -127,6 +127,7 @@ class Max7219FaceController:
         self.transition_active = False
         self.transition_progress = 0.0
         self._button_raw_state = False
+        self._button_debounced_state = False
         self._button_last_change_time = 0.0
 
         if GPIO is not None:
@@ -243,6 +244,19 @@ class Max7219FaceController:
         for module_index in range(4):
             self.clear_module(MOUTH_RIGHT_START + module_index)
 
+    # Contract: Return the mouth module order for the reaction sweep.
+    def get_transition_mouth_sequence(self) -> List[Tuple[int, int]]:
+        return [
+            (MOUTH_LEFT_START + 3, MOUTH_FRAME_1),
+            (MOUTH_RIGHT_START + 0, MOUTH_FRAME_1),
+            (MOUTH_LEFT_START + 2, MOUTH_FRAME_2),
+            (MOUTH_RIGHT_START + 1, MOUTH_FRAME_2),
+            (MOUTH_LEFT_START + 1, MOUTH_FRAME_3),
+            (MOUTH_RIGHT_START + 2, MOUTH_FRAME_3),
+            (MOUTH_LEFT_START + 0, MOUTH_FRAME_4),
+            (MOUTH_RIGHT_START + 3, MOUTH_FRAME_4),
+        ]
+
     # Contract: Render the mouth animation for the requested step.
     def draw_mouth(
         self,
@@ -253,16 +267,7 @@ class Max7219FaceController:
 
         if transition_progress is not None:
             visible_modules = int(round(max(0.0, min(1.0, transition_progress)) * 8))
-            mouth_sequence = [
-                (MOUTH_LEFT_START + 0, MOUTH_FRAME_4),
-                (MOUTH_LEFT_START + 1, MOUTH_FRAME_3),
-                (MOUTH_LEFT_START + 2, MOUTH_FRAME_2),
-                (MOUTH_LEFT_START + 3, MOUTH_FRAME_1),
-                (MOUTH_RIGHT_START + 0, MOUTH_FRAME_1),
-                (MOUTH_RIGHT_START + 1, MOUTH_FRAME_2),
-                (MOUTH_RIGHT_START + 2, MOUTH_FRAME_3),
-                (MOUTH_RIGHT_START + 3, MOUTH_FRAME_4),
-            ]
+            mouth_sequence = self.get_transition_mouth_sequence()
 
             for module_index, bitmap in mouth_sequence[:visible_modules]:
                 self.draw_module(module_index, bitmap)
@@ -343,6 +348,7 @@ class Max7219FaceController:
         if GPIO is None:
             self.boop = False
             self._button_raw_state = False
+            self._button_debounced_state = False
             self._button_last_change_time = time.monotonic()
             return
 
@@ -357,9 +363,10 @@ class Max7219FaceController:
         if now - self._button_last_change_time > (self.button_debounce_ms / 1000.0):
             debounced_boop = self._button_raw_state
 
-            if debounced_boop and not self.boop:
+            if debounced_boop and not self._button_debounced_state:
                 self.start_boop_reaction()
 
+            self._button_debounced_state = debounced_boop
             self.boop = debounced_boop
 
     # Contract: Enter the reaction state and reset the mouth animation sequence.
