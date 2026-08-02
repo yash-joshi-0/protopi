@@ -8,6 +8,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
+from luma.core.error import DeviceNotFoundError
 from luma.core.interface.serial import spi, noop
 from luma.core.render import canvas
 from luma.led_matrix.device import max7219
@@ -122,25 +123,15 @@ class Max7219FaceController:
         self.status_draw = None
         self.status_font = None
         self.status_last_update = 0.0
+        self.status_last_probe_attempt = 0.0
+        self.status_probe_interval_s = 1.0
+        self.status_serial = None
         if self.use_status_screen:
             if ssd1306 is None:
                 raise RuntimeError(
                     "The luma.oled package is required for the XFP111X status screen"
                 )
-            self.status_serial = spi(port=1, device=0, gpio=noop())
-            self.status_device = ssd1306(
-                self.status_serial,
-                width=128,
-                height=64,
-                rotate=0,
-            )
-            self.status_image = Image.new("1", (128, 64), 0)
-            self.status_draw = ImageDraw.Draw(self.status_image)
-            try:
-                self.status_font = ImageFont.load_default()
-            except Exception:  # pragma: no cover - fallback when fonts are unavailable
-                self.status_font = None
-            self.status_device.display(self.status_image)
+            self._initialize_status_screen()
 
         self.matrix_configs: List[MatrixConfig] = []
         self.framebuffer = [[0] * self.width for _ in range(self.height)]
@@ -174,12 +165,48 @@ class Max7219FaceController:
             GPIO.setwarnings(False)
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
+    # Contract: Initialize the OLED status screen if SPI1 becomes available.
+    def _initialize_status_screen(self) -> bool:
+        if not self.use_status_screen:
+            return False
+
+        try:
+            self.status_serial = spi(port=1, device=0, gpio=noop())
+            self.status_device = ssd1306(
+                self.status_serial,
+                width=128,
+                height=64,
+                rotate=0,
+            )
+            self.status_image = Image.new("1", (128, 64), 0)
+            self.status_draw = ImageDraw.Draw(self.status_image)
+            try:
+                self.status_font = ImageFont.load_default()
+            except Exception:  # pragma: no cover - fallback when fonts are unavailable
+                self.status_font = None
+            self.status_device.display(self.status_image)
+            return True
+        except (DeviceNotFoundError, FileNotFoundError, OSError):
+            self.status_serial = None
+            self.status_device = None
+            self.status_image = None
+            self.status_draw = None
+            self.status_font = None
+            return False
+
     # Contract: Update the attached status screen with the current controller state.
     def update_status_screen(self) -> None:
-        if not self.use_status_screen or self.status_device is None:
+        if not self.use_status_screen:
             return
 
         now = time.monotonic()
+        if self.status_device is None:
+            if now - self.status_last_probe_attempt >= self.status_probe_interval_s:
+                self.status_last_probe_attempt = now
+                self._initialize_status_screen()
+            if self.status_device is None:
+                return
+
         if now - self.status_last_update < 0.25:
             return
 
