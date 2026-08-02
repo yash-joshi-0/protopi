@@ -170,29 +170,31 @@ class Max7219FaceController:
         if not self.use_status_screen:
             return False
 
-        try:
-            self.status_serial = spi(port=1, device=0, gpio=noop())
-            self.status_device = ssd1306(
-                self.status_serial,
-                width=128,
-                height=64,
-                rotate=0,
-            )
-            self.status_image = Image.new("1", (128, 64), 0)
-            self.status_draw = ImageDraw.Draw(self.status_image)
+        for device_id in (1, 0):
             try:
-                self.status_font = ImageFont.load_default()
-            except Exception:  # pragma: no cover - fallback when fonts are unavailable
+                self.status_serial = spi(port=1, device=device_id, gpio=noop())
+                self.status_device = ssd1306(
+                    self.status_serial,
+                    width=128,
+                    height=64,
+                    rotate=0,
+                )
+                self.status_image = Image.new("1", (128, 64), 0)
+                self.status_draw = ImageDraw.Draw(self.status_image)
+                try:
+                    self.status_font = ImageFont.load_default()
+                except Exception:  # pragma: no cover - fallback when fonts are unavailable
+                    self.status_font = None
+                self.status_device.display(self.status_image)
+                return True
+            except (DeviceNotFoundError, FileNotFoundError, OSError):
+                self.status_serial = None
+                self.status_device = None
+                self.status_image = None
+                self.status_draw = None
                 self.status_font = None
-            self.status_device.display(self.status_image)
-            return True
-        except (DeviceNotFoundError, FileNotFoundError, OSError):
-            self.status_serial = None
-            self.status_device = None
-            self.status_image = None
-            self.status_draw = None
-            self.status_font = None
-            return False
+
+        return False
 
     # Contract: Update the attached status screen with the current controller state.
     def update_status_screen(self) -> None:
