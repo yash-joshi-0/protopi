@@ -19,7 +19,11 @@ except ImportError:  # pragma: no cover - optional dependency for non-OLED setup
     ssd1306 = None
 
 from PIL import Image, ImageDraw, ImageFont
-import RPi.GPIO as GPIO
+
+try:
+    import RPi.GPIO as GPIO
+except ImportError:  # pragma: no cover - non-Raspberry Pi environments
+    GPIO = None
 
 # User Values: These may need to be changed based on matrix configuration and layout.
 NUM_MATRICES = 14
@@ -165,14 +169,27 @@ class Max7219FaceController:
             GPIO.setwarnings(False)
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-    # Contract: Initialize the OLED status screen if SPI1 becomes available.
+    # Contract: Initialize the OLED status screen using the documented SPI interface.
     def _initialize_status_screen(self) -> bool:
         if not self.use_status_screen:
             return False
 
-        for device_id in (1, 0):
+        if GPIO is None:
+            self.use_status_screen = False
+            return False
+
+        for device_id in (0, 1):
             try:
-                self.status_serial = spi(port=1, device=device_id, gpio=noop())
+                self.status_serial = spi(
+                    port=1,
+                    device=device_id,
+                    gpio=GPIO,
+                    gpio_DC=24,
+                    gpio_RST=25,
+                    bus_speed_hz=8000000,
+                    reset_hold_time=0.2,
+                    reset_release_time=0.2,
+                )
                 self.status_device = ssd1306(
                     self.status_serial,
                     width=128,
