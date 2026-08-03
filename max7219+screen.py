@@ -38,9 +38,8 @@ MOUTH_RIGHT_START = 10
 BUTTON_PIN = 27
 BUTTON_DEBOUNCE_MS = 50
 REACTION_TRANSITION_DURATION_MS = 500
-BUTTON_ACTIVE_STATE = (
-    GPIO.HIGH
-)  # Set this to GPIO.LOW if the button circuit is wired as active-low.
+BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
+# Set this to GPIO.LOW if the button circuit is wired as active-low.
 
 
 # Constants: These should not need to be changed.
@@ -114,6 +113,10 @@ class Max7219FaceController:
         self.height = 8
         self.use_status_screen = use_status_screen
 
+        if GPIO is not None:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+
         self.max7219_serial = spi(port=0, device=0, gpio=noop())
         self.device = max7219(
             self.max7219_serial,
@@ -165,8 +168,6 @@ class Max7219FaceController:
         self._button_last_change_time = 0.0
 
         if GPIO is not None:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     # Contract: Initialize the OLED status screen using the documented SPI interface.
