@@ -112,6 +112,9 @@ on:
           - append
           - replace
 
+permissions:
+  contents: write
+
 jobs:
   comment:
     runs-on: ubuntu-latest
