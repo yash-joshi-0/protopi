@@ -55,23 +55,105 @@ on:
         description: GitHub token used to create the comment.
         required: false
   workflow_dispatch:
+    inputs:
+      commit_choice:
+        description: Select a recent commit to comment on. The label includes part of the commit message.
+        required: true
+        type: choice
+        default: f3bcd45 - Workflow fixes
+        options:
+          - f3bcd45 - Workflow fixes
+          - 080477d - SPI1 fix 3: I am doing it again
+          - d825b89 - SPI1 fix 3: I am doing it again
+          - c81a07e - SPI1 fix 2
+      sha:
+        description: Optional custom commit SHA. Leave blank to use the selected commit above.
+        required: false
+        type: string
+      body:
+        description: The comment body.
+        required: false
+        default: Thanks for the update!
+        type: string
+      repository:
+        description: The full name of the target repository.
+        required: false
+        type: string
+      path:
+        description: Relative path of the file to comment on.
+        required: false
+        type: string
+      position:
+        description: Line index in the diff to comment on.
+        required: false
+        type: string
+      comment-id:
+        description: The id of the comment to update.
+        required: false
+        type: string
+      edit-mode:
+        description: The mode when updating a comment, "replace" or "append".
+        required: false
+        type: choice
+        default: append
+        options:
+          - append
+          - replace
+      reactions:
+        description: A comma or newline separated list of reactions to add to the comment.
+        required: false
+        type: string
+      reactions-edit-mode:
+        description: The mode when updating comment reactions, "replace" or "append".
+        required: false
+        type: choice
+        default: append
+        options:
+          - append
+          - replace
 
 jobs:
   comment:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve selected commit
+        if: github.event_name == 'workflow_dispatch'
+        id: resolve_commit
+        shell: bash
+        run: |
+          choice="${{ github.event.inputs.commit_choice }}"
+          case "$choice" in
+            "f3bcd45 - Workflow fixes")
+              echo "sha=f3bcd45" >> "$GITHUB_OUTPUT"
+              ;;
+            "080477d - SPI1 fix 3: I am doing it again")
+              echo "sha=080477d" >> "$GITHUB_OUTPUT"
+              ;;
+            "d825b89 - SPI1 fix 3: I am doing it again")
+              echo "sha=d825b89" >> "$GITHUB_OUTPUT"
+              ;;
+            "c81a07e - SPI1 fix 2")
+              echo "sha=c81a07e" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              if [ -n "${{ github.event.inputs.sha }}" ]; then
+                echo "sha=${{ github.event.inputs.sha }}" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+          esac
+
       - name: Commit Comment
         uses: peter-evans/commit-comment@v4.0.0
         with:
           token: ${{ secrets.token || github.token }}
-          repository: ${{ inputs.repository || github.repository }}
-          sha: ${{ inputs.sha }}
-          path: ${{ inputs.path }}
-          position: ${{ inputs.position }}
-          comment-id: ${{ inputs.comment-id }}
-          body: ${{ inputs.body }}
-          body-path: ${{ inputs.body-path }}
-          edit-mode: ${{ inputs.edit-mode }}
-          append-separator: ${{ inputs.append-separator }}
-          reactions: ${{ inputs.reactions }}
-          reactions-edit-mode: ${{ inputs.reactions-edit-mode }}
+          repository: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.repository || inputs.repository || github.repository }}
+          sha: ${{ github.event_name == 'workflow_dispatch' && steps.resolve_commit.outputs.sha || inputs.sha }}
+          path: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.path || inputs.path }}
+          position: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.position || inputs.position }}
+          comment-id: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.comment-id || inputs.comment-id }}
+          body: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.body || inputs.body }}
+          body-path: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.body-path || inputs.body-path }}
+          edit-mode: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.edit-mode || inputs.edit-mode }}
+          append-separator: newline
+          reactions: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.reactions || inputs.reactions }}
+          reactions-edit-mode: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.reactions-edit-mode || inputs.reactions-edit-mode }}
