@@ -121,6 +121,12 @@ jobs:
         id: resolve_commit
         shell: bash
         run: |
+          # Use explicit custom SHA if provided
+          if [ -n "${{ github.event.inputs.sha }}" ]; then
+            echo "sha=${{ github.event.inputs.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           choice="${{ github.event.inputs.commit_choice }}"
           case "$choice" in
             "f3bcd45 - Workflow fixes")
@@ -136,24 +142,49 @@ jobs:
               echo "sha=c81a07e" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              if [ -n "${{ github.event.inputs.sha }}" ]; then
-                echo "sha=${{ github.event.inputs.sha }}" >> "$GITHUB_OUTPUT"
-              fi
+              echo "::error::Could not resolve a commit SHA from choice: $choice"
+              exit 1
               ;;
           esac
+
+      - name: Set inputs as env vars
+        id: set_inputs
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "resolved_sha=${{ steps.resolve_commit.outputs.sha }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_repository=${{ github.event.inputs.repository || github.repository }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_path=${{ github.event.inputs.path }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_position=${{ github.event.inputs.position }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_comment_id=${{ github.event.inputs.comment-id }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_body=${{ github.event.inputs.body }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_edit_mode=${{ github.event.inputs.edit-mode }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_reactions=${{ github.event.inputs.reactions }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_reactions_edit_mode=${{ github.event.inputs.reactions-edit-mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "resolved_sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_repository=${{ inputs.repository || github.repository }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_path=${{ inputs.path }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_position=${{ inputs.position }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_comment_id=${{ inputs.comment-id }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_body=${{ inputs.body }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_edit_mode=${{ inputs.edit-mode }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_reactions=${{ inputs.reactions }}" >> "$GITHUB_OUTPUT"
+            echo "resolved_reactions_edit_mode=${{ inputs.reactions-edit-mode }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Commit Comment
         uses: peter-evans/commit-comment@v4.0.0
         with:
-          token: ${{ secrets.token || github.token }}
-          repository: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.repository || inputs.repository || github.repository }}
-          sha: ${{ github.event_name == 'workflow_dispatch' && steps.resolve_commit.outputs.sha || inputs.sha }}
-          path: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.path || inputs.path }}
-          position: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.position || inputs.position }}
-          comment-id: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.comment-id || inputs.comment-id }}
-          body: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.body || inputs.body }}
-          body-path: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.body-path || inputs.body-path }}
-          edit-mode: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.edit-mode || inputs.edit-mode }}
-          append-separator: newline
-          reactions: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.reactions || inputs.reactions }}
-          reactions-edit-mode: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.reactions-edit-mode || inputs.reactions-edit-mode }}
+          token: ${{ secrets.token != '' && secrets.token || github.token }}
+          repository: ${{ steps.set_inputs.outputs.resolved_repository }}
+          sha: ${{ steps.set_inputs.outputs.resolved_sha }}
+          path: ${{ steps.set_inputs.outputs.resolved_path }}
+          position: ${{ steps.set_inputs.outputs.resolved_position }}
+          comment-id: ${{ steps.set_inputs.outputs.resolved_comment_id }}
+          body: ${{ steps.set_inputs.outputs.resolved_body }}
+          body-path: ${{ inputs.body-path }}
+          edit-mode: ${{ steps.set_inputs.outputs.resolved_edit_mode }}
+          append-separator: ${{ inputs.append-separator || 'newline' }}
+          reactions: ${{ steps.set_inputs.outputs.resolved_reactions }}
+          reactions-edit-mode: ${{ steps.set_inputs.outputs.resolved_reactions_edit_mode }}
