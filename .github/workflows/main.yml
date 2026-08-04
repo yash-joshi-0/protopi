@@ -1,29 +1,77 @@
-- name: Commit Comment
-  # You may pin to the exact commit or the version.
-  # uses: peter-evans/commit-comment@f6d60c65d05bb59f750fa51ad3de1d443ba0eb52
-  uses: peter-evans/commit-comment@v4.0.0
-  with:
-    # The GitHub authentication token
-    token: # optional, default is ${{ github.token }}
-    # The full name of the target repository.
-    repository: # optional, default is ${{ github.repository }}
-    # The commit SHA.
-    sha: # optional
-    # Relative path of the file to comment on.
-    path: # optional
-    # Line index in the diff to comment on.
-    position: # optional
-    # The id of the comment to update.
-    comment-id: # optional
-    # The comment body. Cannot be used in conjunction with `body-path`.
-    body: # optional
-    # The path to a file containing the comment body. Cannot be used in conjunction with `body`.
-    body-path: # optional
-    # The mode when updating a comment, "replace" or "append".
-    edit-mode: # optional, default is append
-    # The separator to use when appending to an existing comment. (`newline`, `space`, `none`)
-    append-separator: # optional, default is newline
-    # A comma or newline separated list of reactions to add to the comment.
-    reactions: # optional
-    # The mode when updating comment reactions, "replace" or "append".
-    reactions-edit-mode: # optional, default is append
+name: Commit Comment
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: The full name of the target repository.
+        required: false
+        type: string
+      sha:
+        description: The commit SHA.
+        required: false
+        type: string
+      path:
+        description: Relative path of the file to comment on.
+        required: false
+        type: string
+      position:
+        description: Line index in the diff to comment on.
+        required: false
+        type: string
+      comment-id:
+        description: The id of the comment to update.
+        required: false
+        type: string
+      body:
+        description: The comment body.
+        required: false
+        type: string
+      body-path:
+        description: The path to a file containing the comment body.
+        required: false
+        type: string
+      edit-mode:
+        description: The mode when updating a comment, "replace" or "append".
+        required: false
+        type: string
+        default: append
+      append-separator:
+        description: The separator to use when appending to an existing comment.
+        required: false
+        type: string
+        default: newline
+      reactions:
+        description: A comma or newline separated list of reactions to add to the comment.
+        required: false
+        type: string
+      reactions-edit-mode:
+        description: The mode when updating comment reactions, "replace" or "append".
+        required: false
+        type: string
+        default: append
+    secrets:
+      token:
+        description: GitHub token used to create the comment.
+        required: false
+  workflow_dispatch:
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Commit Comment
+        uses: peter-evans/commit-comment@v4.0.0
+        with:
+          token: ${{ secrets.token || github.token }}
+          repository: ${{ inputs.repository || github.repository }}
+          sha: ${{ inputs.sha }}
+          path: ${{ inputs.path }}
+          position: ${{ inputs.position }}
+          comment-id: ${{ inputs.comment-id }}
+          body: ${{ inputs.body }}
+          body-path: ${{ inputs.body-path }}
+          edit-mode: ${{ inputs.edit-mode }}
+          append-separator: ${{ inputs.append-separator }}
+          reactions: ${{ inputs.reactions }}
+          reactions-edit-mode: ${{ inputs.reactions-edit-mode }}
