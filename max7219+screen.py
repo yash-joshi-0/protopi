@@ -37,7 +37,6 @@ MOUTH_RIGHT_START = 10
 # Configuration values: These can be changes to personal preference.
 BUTTON_PIN = 27
 BUTTON_DEBOUNCE_MS = 50
-REACTION_TRANSITION_DURATION_MS = 500
 BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
 # Set this to GPIO.LOW if the button circuit is wired as active-low.
 
@@ -46,6 +45,11 @@ BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
 CONFIG_FILE = "matrix_config.txt"
 WIDTH = NUM_MATRICES * 8
 HEIGHT = 8
+
+if GPIO is not None:
+    BUTTON_PULL = GPIO.PUD_DOWN if BUTTON_ACTIVE_STATE == GPIO.HIGH else GPIO.PUD_UP
+else:
+    BUTTON_PULL = None
 
 
 # Class: FaceState represents the supported animation states for the face.
@@ -101,7 +105,6 @@ class Max7219FaceController:
         self,
         num_matrices: int = NUM_MATRICES,
         config_path: Path | None = None,
-        reaction_transition_duration_ms: int = REACTION_TRANSITION_DURATION_MS,
         button_debounce_ms: int = BUTTON_DEBOUNCE_MS,
         use_status_screen: bool = True,
     ) -> None:
@@ -142,12 +145,11 @@ class Max7219FaceController:
 
         self.matrix_configs: List[MatrixConfig] = []
         self.framebuffer = [[0] * self.width for _ in range(self.height)]
+        self.load_matrix_config()
 
         self.calibration_mode = False
         self.show_markers = True
         self.active_matrix = 0
-        self.marker_blink = True
-        self.last_marker_blink = time.monotonic()
 
         self.face_state = FaceState.IDLE
         self.next_blink = time.monotonic() + random.uniform(5, 10)
@@ -158,17 +160,15 @@ class Max7219FaceController:
         self.last_mouth_frame = 0.0
         self.boop = False
         self.button_pin = BUTTON_PIN
-        self.reaction_transition_duration_ms = reaction_transition_duration_ms
         self.button_debounce_ms = button_debounce_ms
-        self.reaction_transition_start = 0.0
-        self.transition_active = False
-        self.transition_progress = 0.0
         self._button_raw_state = False
         self._button_debounced_state = False
-        self._button_last_change_time = 0.0
+        self._button_last_change_time = time.monotonic()
+        self._gpio_configured = False
 
         if GPIO is not None:
-            GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=BUTTON_PULL)
+            self._gpio_configured = True
 
     # Contract: Initialize the OLED status screen using the documented SPI interface.
     def _initialize_status_screen(self) -> bool:
@@ -238,8 +238,7 @@ class Max7219FaceController:
             f"blink={self.face_state == FaceState.BLINK}\n"
             f"boop={self.boop}\n"
             f"mouth_step={self.mouth_step}\n"
-            f"reaction_phase={self.reaction_phase}\n"
-            f"transition={self.transition_active}"
+            f"reaction_phase={self.reaction_phase}"
         )
 
         if self.status_font is not None:
@@ -249,23 +248,25 @@ class Max7219FaceController:
 
         self.status_device.display(self.status_image)
 
-    # Contract: Load per-matrix transforms from disk and fill any missing entries with defaults.
+    # Contract: Load per-matrix transforms from disk, skipping unusable lines.
     def load_matrix_config(self) -> None:
         self.matrix_configs = []
 
         if self.config_path.exists():
             with self.config_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.strip()
                     if not line or line.startswith("#"):
                         continue
 
-                    rotation_text, flip_x_text, flip_y_text = line.split(",")
-                    matrix_config = MatrixConfig(
-                        rotation=int(rotation_text),
-                        flip_x=bool(int(flip_x_text)),
-                        flip_y=bool(int(flip_y_text)),
-                    )
+                    if len(self.matrix_configs) >= self.num_matrices:
+                        print(
+                            f"Warning: {self.config_path.name} line {line_number}: "
+                            f"more than {self.num_matrices} entries, ignoring the rest."
+                        )
+                        break
+
+                    matrix_config = self.parse_matrix_config_line(line, line_number)
                     matrix_config.rebuild_map()
                     self.matrix_configs.append(matrix_config)
 
@@ -273,6 +274,33 @@ class Max7219FaceController:
             matrix_config = MatrixConfig()
             matrix_config.rebuild_map()
             self.matrix_configs.append(matrix_config)
+
+    # Contract: Parse one config line into a MatrixConfig, falling back to defaults.
+    def parse_matrix_config_line(self, line: str, line_number: int) -> MatrixConfig:
+        location = f"{self.config_path.name} line {line_number}"
+
+        try:
+            rotation_text, flip_x_text, flip_y_text = line.split(",")
+            matrix_config = MatrixConfig(
+                rotation=int(rotation_text),
+                flip_x=bool(int(flip_x_text)),
+                flip_y=bool(int(flip_y_text)),
+            )
+        except ValueError:
+            print(
+                f"Warning: {location}: expected rotation,xflip,yflip "
+                f"but found {line!r}, using defaults."
+            )
+            return MatrixConfig()
+
+        if matrix_config.rotation % 90 != 0:
+            print(
+                f"Warning: {location}: rotation {matrix_config.rotation} is not a "
+                f"multiple of 90, using 0."
+            )
+            matrix_config.rotation = 0
+
+        return matrix_config
 
     # Contract: Persist the current matrix transform settings to disk.
     def save_matrix_config(self) -> None:
@@ -298,17 +326,21 @@ class Max7219FaceController:
                     if self.framebuffer[y_position][x_position]:
                         draw.point((x_position, y_position), fill="white")
 
-    # Contract: Draw the calibration markers for the active matrix state.
+    # Contract: Mark each module's transformed origin during calibration.
     def draw_corner_markers(self) -> None:
         if not self.calibration_mode or not self.show_markers:
             return
 
         for module_index in range(self.num_matrices):
-            if module_index == self.active_matrix and not self.marker_blink:
-                continue
+            lookup = self.matrix_configs[module_index].transform_map
+            offset = module_index * 8
 
-            x_position = module_index * 8
-            self.framebuffer[0][x_position] = 1
+            marker_size = 2 if module_index == self.active_matrix else 1
+
+            for row_index in range(marker_size):
+                for column_index in range(marker_size):
+                    x_position, y_position = lookup[row_index][column_index]
+                    self.framebuffer[y_position][offset + x_position] = 1
 
     # Contract: Render a single module bitmap using the relevant transform map.
     def draw_module(self, module_index: int, bitmap: Sequence[int]) -> None:
@@ -358,35 +390,9 @@ class Max7219FaceController:
         for module_index in range(4):
             self.clear_module(MOUTH_RIGHT_START + module_index)
 
-    # Contract: Return the mouth module order for the reaction sweep.
-    def get_transition_mouth_sequence(self) -> List[Tuple[int, int]]:
-        return [
-            (MOUTH_LEFT_START + 3, MOUTH_FRAME_1),
-            (MOUTH_RIGHT_START + 0, MOUTH_FRAME_1),
-            (MOUTH_LEFT_START + 2, MOUTH_FRAME_2),
-            (MOUTH_RIGHT_START + 1, MOUTH_FRAME_2),
-            (MOUTH_LEFT_START + 1, MOUTH_FRAME_3),
-            (MOUTH_RIGHT_START + 2, MOUTH_FRAME_3),
-            (MOUTH_LEFT_START + 0, MOUTH_FRAME_4),
-            (MOUTH_RIGHT_START + 3, MOUTH_FRAME_4),
-        ]
-
     # Contract: Render the mouth animation for the requested step.
-    def draw_mouth(
-        self,
-        step: int = 0,
-        transition_progress: float | None = None,
-    ) -> None:
+    def draw_mouth(self, step: int = 0) -> None:
         self.clear_mouth_modules()
-
-        if transition_progress is not None:
-            visible_modules = int(round(max(0.0, min(1.0, transition_progress)) * 8))
-            mouth_sequence = self.get_transition_mouth_sequence()
-
-            for module_index, bitmap in mouth_sequence[:visible_modules]:
-                self.draw_module(module_index, bitmap)
-
-            return
 
         self.draw_module(MOUTH_LEFT_START + 0, MOUTH_FRAME_4)
         self.draw_module(MOUTH_LEFT_START + 1, MOUTH_FRAME_3)
@@ -417,16 +423,11 @@ class Max7219FaceController:
             self.clear_module(MOUTH_RIGHT_START + 2)
 
     # Contract: Render the complete face using the current animation state.
-    def render_face(
-        self,
-        blink: bool = False,
-        mouth_step: int = 0,
-        transition_progress: float | None = None,
-    ) -> None:
+    def render_face(self, blink: bool = False, mouth_step: int = 0) -> None:
         self.clear()
         self.draw_eyes(blink)
         self.draw_nose()
-        self.draw_mouth(mouth_step, transition_progress=transition_progress)
+        self.draw_mouth(mouth_step)
         self.draw_corner_markers()
         self.flush()
         self.update_status_screen()
@@ -436,27 +437,9 @@ class Max7219FaceController:
         if self.face_state == FaceState.BLINK:
             self.render_face(blink=True)
         elif self.face_state == FaceState.REACT:
-            if self.transition_active:
-                self.render_face(
-                    blink=True,
-                    mouth_step=0,
-                    transition_progress=self.transition_progress,
-                )
-            else:
-                self.render_face(blink=True, mouth_step=self.mouth_step)
+            self.render_face(blink=True, mouth_step=self.mouth_step)
         else:
             self.render_face()
-
-    # Contract: Toggle the calibration marker blink state at the configured interval.
-    def update_marker_blink(self) -> None:
-        if not self.calibration_mode:
-            return
-
-        now = time.monotonic()
-        if now - self.last_marker_blink > 0.5:
-            self.marker_blink = not self.marker_blink
-            self.last_marker_blink = now
-            self.redraw()
 
     # Contract: Read the button input and trigger a reaction when booping begins.
     def update_boop_state(self) -> None:
@@ -485,17 +468,10 @@ class Max7219FaceController:
             self.boop = debounced_boop
 
     # Contract: Enter the reaction state and reset the mouth animation sequence.
-    def start_boop_reaction(self, transition_duration_ms: int | None = None) -> None:
-        if transition_duration_ms is None:
-            transition_duration_ms = self.reaction_transition_duration_ms
-
+    def start_boop_reaction(self) -> None:
         self.face_state = FaceState.REACT
-        self.transition_active = False
-        self.transition_progress = 0.0
         self.reaction_phase = 1
         self.mouth_step = 0
-        self.reaction_transition_start = time.monotonic()
-        self.reaction_transition_duration_ms = transition_duration_ms
         self.last_mouth_frame = time.monotonic()
         self.render_face(blink=True, mouth_step=0)
         self.update_status_screen()
@@ -574,16 +550,25 @@ class Max7219FaceController:
         print("--------------------------------------")
         print()
 
-    # Contract: Refresh the display and run the marker blink update.
-    def render(self) -> None:
-        self.update_marker_blink()
-        self.redraw()
+    # Contract: Blank every attached display and release the claimed GPIO channel.
+    def shutdown(self) -> None:
+        self.clear()
+        self.flush()
 
-    # Contract: Initialize configuration, run calibration, and return the next blink time.
+        if self.status_device is not None:
+            try:
+                self.status_device.display(Image.new("1", (128, 64), 0))
+            except OSError as error:
+                print(f"Warning: could not blank the status screen: {error}")
+
+        if GPIO is not None and self._gpio_configured:
+            GPIO.cleanup(self.button_pin)
+            self._gpio_configured = False
+
+    # Contract: Run calibration and return the next blink time.
     def start(self) -> float:
-        self.load_matrix_config()
         self.configure_matrices()
-        self.render()
+        self.redraw()
         print("Face initialized.")
         return time.monotonic() + random.uniform(5, 10)
 
@@ -592,7 +577,6 @@ class Max7219FaceController:
         self.next_blink = self.start()
 
         while True:
-            self.update_marker_blink()
             self.update_boop_state()
 
             if self.face_state == FaceState.IDLE:
@@ -605,7 +589,7 @@ class Max7219FaceController:
                 else:
                     self.face_state = FaceState.IDLE
                     self.next_blink = time.monotonic() + random.uniform(5, 10)
-                    self.render()
+                    self.redraw()
             elif self.face_state == FaceState.REACT:
                 if self.boop:
                     if self.reaction_phase == 1:
@@ -621,9 +605,7 @@ class Max7219FaceController:
                     self.reaction_phase = 0
                     self.mouth_step = 0
                     self.face_state = FaceState.IDLE
-                    self.transition_active = False
-                    self.transition_progress = 0.0
-                    self.render()
+                    self.redraw()
 
                 self.update_status_screen()
 
@@ -640,8 +622,7 @@ def main() -> None:
         print()
         print("Exiting...")
     finally:
-        controller.clear()
-        controller.flush()
+        controller.shutdown()
 
 
 BLINK_FRAME_1 = [
