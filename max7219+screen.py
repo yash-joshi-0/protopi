@@ -43,8 +43,7 @@ STATUS_SCREEN_SPI_PORT = 1
 STATUS_SCREEN_SPI_DEVICE = 0
 STATUS_SCREEN_DC_PIN = 24
 STATUS_SCREEN_RST_PIN = 25
-STATUS_SCREEN_REFRESH_MS = 1000
-STATUS_SCREEN_FORCE_REDRAW_MS = 5000
+STATUS_SCREEN_REFRESH_MS = 0
 STATUS_SCREEN_PROBE_INTERVAL_MS = 1000
 STATUS_SCREEN_BUS_SPEED_HZ = 4000000
 
@@ -142,12 +141,9 @@ class Max7219FaceController:
         self.status_font = None
         self.status_serial = None
         self.status_last_update = 0.0
-        self.status_last_redraw = 0.0
         self.status_last_probe_attempt = 0.0
         self.status_probe_interval_ms = STATUS_SCREEN_PROBE_INTERVAL_MS
         self.status_refresh_ms = STATUS_SCREEN_REFRESH_MS
-        self.status_force_redraw_ms = STATUS_SCREEN_FORCE_REDRAW_MS
-        self.status_shown_lines: List[str] | None = None
         self._status_failure_reported = False
 
         if self.use_status_screen and sh1106 is None:
@@ -259,17 +255,24 @@ class Max7219FaceController:
         self.status_device.display(
             Image.new("1", (STATUS_SCREEN_WIDTH, STATUS_SCREEN_HEIGHT), 0)
         )
-        self.status_shown_lines = None
 
-    # Contract: Return the lines of controller state to show on the status screen.
+    # Contract: Return the status lines, listing the face state plus whatever is active.
     def get_status_lines(self) -> List[str]:
-        return [
-            f"face_state={self.face_state.name}",
-            f"blink={self.face_state == FaceState.BLINK}",
-            f"boop={self.boop}",
-            f"mouth_step={self.mouth_step}",
-            f"reaction_phase={self.reaction_phase}",
-        ]
+        lines = [f"face_state={self.face_state.name}"]
+
+        if self.face_state == FaceState.BLINK:
+            lines.append("blink")
+
+        if self.boop:
+            lines.append("boop")
+
+        if self.reaction_phase:
+            lines.append(f"reaction_phase={self.reaction_phase}")
+
+        if self.mouth_step:
+            lines.append(f"mouth_step={self.mouth_step}")
+
+        return lines
 
     # Contract: Draw the given lines into a status screen sized image.
     def render_status_image(self, lines: List[str]) -> Image.Image:
@@ -302,24 +305,16 @@ class Max7219FaceController:
             return
 
         self.status_last_update = now
-        lines = self.get_status_lines()
-        stale = now - self.status_last_redraw >= (self.status_force_redraw_ms / 1000.0)
-
-        if lines == self.status_shown_lines and not stale:
-            return
 
         try:
-            self.status_device.display(self.render_status_image(lines))
+            self.status_device.display(
+                self.render_status_image(self.get_status_lines())
+            )
         except OSError as error:
             self.report_status_failure(error)
             self.status_serial = None
             self.status_device = None
             self.status_font = None
-            self.status_shown_lines = None
-            return
-
-        self.status_shown_lines = lines
-        self.status_last_redraw = now
 
     # Contract: Load per-matrix transforms from disk, skipping unusable lines.
     def load_matrix_config(self) -> None:
