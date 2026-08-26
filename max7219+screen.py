@@ -14,9 +14,9 @@ from luma.core.render import canvas
 from luma.led_matrix.device import max7219
 
 try:
-    from luma.oled.device import ssd1306
+    from luma.oled.device import sh1106
 except ImportError:  # pragma: no cover - optional dependency for non-OLED setups
-    ssd1306 = None
+    sh1106 = None
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -150,7 +150,7 @@ class Max7219FaceController:
         self.status_shown_lines: List[str] | None = None
         self._status_failure_reported = False
 
-        if self.use_status_screen and ssd1306 is None:
+        if self.use_status_screen and sh1106 is None:
             print(
                 "Warning: luma.oled is not installed, continuing without the "
                 "status screen."
@@ -207,7 +207,7 @@ class Max7219FaceController:
                 reset_hold_time=0.2,
                 reset_release_time=0.2,
             )
-            self.status_device = ssd1306(
+            self.status_device = sh1106(
                 self.status_serial,
                 width=STATUS_SCREEN_WIDTH,
                 height=STATUS_SCREEN_HEIGHT,

@@ -35,6 +35,5 @@ and 4, and so on down to pins 39 and 40.
 - Supply and ground wiring for the two displays is not recorded per pin here; only the signal lines are.
 - The MAX7219 face display is on **SPI0** (`/dev/spidev0.0`): GPIO10 for MOSI, GPIO11 for SCLK, GPIO8 for chip select.
 - The XFP111X status screen is on **SPI1 CE0** (`/dev/spidev1.0`): GPIO20 for MOSI, GPIO21 for SCLK, GPIO18 for chip select, plus GPIO24 for DC and GPIO25 for reset. Confirmed working on this wiring.
-- GPIO7 is **not** connected to the status screen. An earlier revision of this file labelled it "OLED CS / SPI1 CE1", which is wrong twice over: GPIO7 is SPI0 CE1, and the screen is not on it at all.
 - SPI0 is enabled with `dtparam=spi=on` (or `sudo raspi-config` under Interface Options).
 - **SPI1 additionally needs `dtoverlay=spi1-1cs` in `/boot/firmware/config.txt`.** Without it `/dev/spidev1.0` never appears and the status screen cannot be opened, no matter how the code is configured. Reboot after adding it.
