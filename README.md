@@ -3,7 +3,7 @@
 | Feature   | Status    |
 |---        |---        |
 |MAX7219 Support    | ![static badge](https://img.shields.io/badge/Basic%20Support-29BF12)  |
-|XFP111X Support    | ![static badge](https://img.shields.io/badge/In%20Progress-F0C808)
+|XFP111X Support    | ![static badge](https://img.shields.io/badge/Done-29BF12) |
 |HUB75 Support    | ![static badge](https://img.shields.io/badge/Not%20Started-FE0B0B)  |
 |Wireless Access Point    | ![static badge](https://img.shields.io/badge/Not%20Started-FE0B0B)  |
 |Config/Communicate Page    | ![static badge](https://img.shields.io/badge/Not%20Started-FE0B0B)  |
