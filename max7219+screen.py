@@ -14,9 +14,9 @@ from luma.core.render import canvas
 from luma.led_matrix.device import max7219
 
 try:
-    from luma.oled.device import ssd1306
+    from luma.oled.device import sh1106
 except ImportError:  # pragma: no cover - optional dependency for non-OLED setups
-    ssd1306 = None
+    sh1106 = None
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -39,12 +39,21 @@ BUTTON_PIN = 27
 BUTTON_DEBOUNCE_MS = 50
 BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
 # Set this to GPIO.LOW if the button circuit is wired as active-low.
+STATUS_SCREEN_SPI_PORT = 1
+STATUS_SCREEN_SPI_DEVICE = 0
+STATUS_SCREEN_DC_PIN = 24
+STATUS_SCREEN_RST_PIN = 25
+STATUS_SCREEN_REFRESH_MS = 0
+STATUS_SCREEN_PROBE_INTERVAL_MS = 1000
+STATUS_SCREEN_BUS_SPEED_HZ = 4000000
 
 
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
 WIDTH = NUM_MATRICES * 8
 HEIGHT = 8
+STATUS_SCREEN_WIDTH = 128
+STATUS_SCREEN_HEIGHT = 64
 
 if GPIO is not None:
     BUTTON_PULL = GPIO.PUD_DOWN if BUTTON_ACTIVE_STATE == GPIO.HIGH else GPIO.PUD_UP
@@ -129,18 +138,22 @@ class Max7219FaceController:
         self.device.contrast(1)
 
         self.status_device = None
-        self.status_image = None
-        self.status_draw = None
         self.status_font = None
+        self.status_serial = None
         self.status_last_update = 0.0
         self.status_last_probe_attempt = 0.0
-        self.status_probe_interval_s = 1.0
-        self.status_serial = None
+        self.status_probe_interval_ms = STATUS_SCREEN_PROBE_INTERVAL_MS
+        self.status_refresh_ms = STATUS_SCREEN_REFRESH_MS
+        self._status_failure_reported = False
+
+        if self.use_status_screen and sh1106 is None:
+            print(
+                "Warning: luma.oled is not installed, continuing without the "
+                "status screen."
+            )
+            self.use_status_screen = False
+
         if self.use_status_screen:
-            if ssd1306 is None:
-                raise RuntimeError(
-                    "The luma.oled package is required for the XFP111X status screen"
-                )
             self._initialize_status_screen()
 
         self.matrix_configs: List[MatrixConfig] = []
@@ -170,7 +183,7 @@ class Max7219FaceController:
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=BUTTON_PULL)
             self._gpio_configured = True
 
-    # Contract: Initialize the OLED status screen using the documented SPI interface.
+    # Contract: Initialize the OLED status screen on the configured SPI chip select.
     def _initialize_status_screen(self) -> bool:
         if not self.use_status_screen:
             return False
@@ -179,40 +192,100 @@ class Max7219FaceController:
             self.use_status_screen = False
             return False
 
-        for device_id in (0, 1):
-            try:
-                self.status_serial = spi(
-                    port=1,
-                    device=device_id,
-                    gpio=GPIO,
-                    gpio_DC=24,
-                    gpio_RST=25,
-                    bus_speed_hz=8000000,
-                    reset_hold_time=0.2,
-                    reset_release_time=0.2,
-                )
-                self.status_device = ssd1306(
-                    self.status_serial,
-                    width=128,
-                    height=64,
-                    rotate=0,
-                )
-                self.status_image = Image.new("1", (128, 64), 0)
-                self.status_draw = ImageDraw.Draw(self.status_image)
-                try:
-                    self.status_font = ImageFont.load_default()
-                except Exception:  # pragma: no cover - fallback when fonts are unavailable
-                    self.status_font = None
-                self.status_device.display(self.status_image)
-                return True
-            except (DeviceNotFoundError, FileNotFoundError, OSError):
-                self.status_serial = None
-                self.status_device = None
-                self.status_image = None
-                self.status_draw = None
-                self.status_font = None
+        try:
+            self.status_serial = spi(
+                port=STATUS_SCREEN_SPI_PORT,
+                device=STATUS_SCREEN_SPI_DEVICE,
+                gpio=GPIO,
+                gpio_DC=STATUS_SCREEN_DC_PIN,
+                gpio_RST=STATUS_SCREEN_RST_PIN,
+                bus_speed_hz=STATUS_SCREEN_BUS_SPEED_HZ,
+                reset_hold_time=0.2,
+                reset_release_time=0.2,
+            )
+            self.status_device = sh1106(
+                self.status_serial,
+                width=STATUS_SCREEN_WIDTH,
+                height=STATUS_SCREEN_HEIGHT,
+                rotate=0,
+            )
+            self.status_font = self.load_status_font()
+            self.blank_status_screen()
+        except (DeviceNotFoundError, FileNotFoundError, OSError) as error:
+            self.report_status_failure(error)
+            self.status_serial = None
+            self.status_device = None
+            self.status_font = None
+            return False
 
-        return False
+        if self._status_failure_reported:
+            print(
+                f"Status screen reconnected on /dev/spidev"
+                f"{STATUS_SCREEN_SPI_PORT}.{STATUS_SCREEN_SPI_DEVICE}."
+            )
+            self._status_failure_reported = False
+
+        return True
+
+    # Contract: Report the first status screen failure and stay quiet while retrying.
+    def report_status_failure(self, error: Exception) -> None:
+        if self._status_failure_reported:
+            return
+
+        print(
+            f"Warning: no status screen on /dev/spidev"
+            f"{STATUS_SCREEN_SPI_PORT}.{STATUS_SCREEN_SPI_DEVICE} ({error}). "
+            f"The face keeps running; retrying every "
+            f"{self.status_probe_interval_ms} ms."
+        )
+        self._status_failure_reported = True
+
+    # Contract: Load the bitmap font for the status screen, or None when unavailable.
+    def load_status_font(self) -> ImageFont.ImageFont | None:
+        try:
+            return ImageFont.load_default()
+        except OSError:  # pragma: no cover - fallback when fonts are unavailable
+            return None
+
+    # Contract: Push an all-off frame to the status screen.
+    def blank_status_screen(self) -> None:
+        if self.status_device is None:
+            return
+
+        self.status_device.display(
+            Image.new("1", (STATUS_SCREEN_WIDTH, STATUS_SCREEN_HEIGHT), 0)
+        )
+
+    # Contract: Return the status lines, listing the face state plus whatever is active.
+    def get_status_lines(self) -> List[str]:
+        lines = [f"face_state={self.face_state.name}"]
+
+        if self.face_state == FaceState.BLINK:
+            lines.append("blink")
+
+        if self.boop:
+            lines.append("boop")
+
+        if self.reaction_phase:
+            lines.append(f"reaction_phase={self.reaction_phase}")
+
+        if self.mouth_step:
+            lines.append(f"mouth_step={self.mouth_step}")
+
+        return lines
+
+    # Contract: Draw the given lines into a status screen sized image.
+    def render_status_image(self, lines: List[str]) -> Image.Image:
+        image = Image.new("1", (STATUS_SCREEN_WIDTH, STATUS_SCREEN_HEIGHT), 0)
+        draw = ImageDraw.Draw(image)
+        text = "\n".join(lines)
+
+        if self.status_font is not None:
+            draw.text((0, 0), text, font=self.status_font, fill=1)
+        else:
+            draw.text((0, 0), text, fill=1)
+
+        return image
 
     # Contract: Update the attached status screen with the current controller state.
     def update_status_screen(self) -> None:
@@ -221,32 +294,27 @@ class Max7219FaceController:
 
         now = time.monotonic()
         if self.status_device is None:
-            if now - self.status_last_probe_attempt >= self.status_probe_interval_s:
+            probe_interval_s = self.status_probe_interval_ms / 1000.0
+            if now - self.status_last_probe_attempt >= probe_interval_s:
                 self.status_last_probe_attempt = now
                 self._initialize_status_screen()
             if self.status_device is None:
                 return
 
-        if now - self.status_last_update < 0.25:
+        if now - self.status_last_update < (self.status_refresh_ms / 1000.0):
             return
 
         self.status_last_update = now
-        self.status_image = Image.new("1", (128, 64), 0)
-        self.status_draw = ImageDraw.Draw(self.status_image)
-        text = (
-            f"face_state={self.face_state.name}\n"
-            f"blink={self.face_state == FaceState.BLINK}\n"
-            f"boop={self.boop}\n"
-            f"mouth_step={self.mouth_step}\n"
-            f"reaction_phase={self.reaction_phase}"
-        )
 
-        if self.status_font is not None:
-            self.status_draw.text((0, 0), text, font=self.status_font, fill=1)
-        else:
-            self.status_draw.text((0, 0), text, fill=1)
-
-        self.status_device.display(self.status_image)
+        try:
+            self.status_device.display(
+                self.render_status_image(self.get_status_lines())
+            )
+        except OSError as error:
+            self.report_status_failure(error)
+            self.status_serial = None
+            self.status_device = None
+            self.status_font = None
 
     # Contract: Load per-matrix transforms from disk, skipping unusable lines.
     def load_matrix_config(self) -> None:
@@ -555,11 +623,10 @@ class Max7219FaceController:
         self.clear()
         self.flush()
 
-        if self.status_device is not None:
-            try:
-                self.status_device.display(Image.new("1", (128, 64), 0))
-            except OSError as error:
-                print(f"Warning: could not blank the status screen: {error}")
+        try:
+            self.blank_status_screen()
+        except OSError as error:
+            print(f"Warning: could not blank the status screen: {error}")
 
         if GPIO is not None and self._gpio_configured:
             GPIO.cleanup(self.button_pin)
