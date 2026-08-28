@@ -48,6 +48,8 @@ MAXIMUM_PASSPHRASE_LENGTH = 63
 MINIMUM_SSID_LENGTH = 1
 MAXIMUM_SSID_LENGTH = 32
 MAXIMUM_REQUEST_BYTES = 65536
+PROTECTED_MANAGEMENT_FRAMES_DISABLED = "1"
+UNSET_REGULATORY_DOMAIN = "country 00:"
 TWO_GHZ_CHANNELS = range(1, 15)
 FIVE_GHZ_CHANNELS = range(32, 178)
 
@@ -197,6 +199,10 @@ class AccessPointController:
                 "rsn",
                 "wifi-sec.pairwise",
                 "ccmp",
+                "wifi-sec.group",
+                "ccmp",
+                "wifi-sec.pmf",
+                PROTECTED_MANAGEMENT_FRAMES_DISABLED,
                 "wifi-sec.psk",
                 self.passphrase,
                 "ipv4.method",
@@ -208,6 +214,37 @@ class AccessPointController:
             ]
         )
 
+    # Contract: Return the output of a diagnostic command, or "" when it cannot run.
+    def read_command_output(self, arguments: List[str]) -> str:
+        binary_path = shutil.which(arguments[0])
+
+        if binary_path is None:
+            return ""
+
+        try:
+            completed = subprocess.run(
+                [binary_path, *arguments[1:]],
+                capture_output=True,
+                text=True,
+                timeout=NMCLI_TIMEOUT_MS / 1000,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Warning: could not run {arguments[0]} ({error}).")
+            return ""
+
+        return completed.stdout
+
+    # Contract: Warn about the radio conditions that make an AP time out on startup.
+    def report_radio_warnings(self) -> None:
+        if "Soft blocked: yes" in self.read_command_output(["rfkill", "list", "wifi"]):
+            print(
+                "Warning: the Wi-Fi radio is soft blocked; run 'rfkill unblock wifi'."
+            )
+
+        if UNSET_REGULATORY_DOMAIN in self.read_command_output(["iw", "reg", "get"]):
+            print("Warning: no WLAN country is set, which blocks AP mode on the Pi.")
+            print("Warning: set one with 'raspi-config' under Localisation Options.")
+
     # Contract: Bring the hotspot up and report whether it is now serving clients.
     def start(self) -> bool:
         if self.nmcli_path is None:
@@ -217,12 +254,15 @@ class AccessPointController:
         if hasattr(os, "geteuid") and os.geteuid() != 0:
             print("Warning: not running as root; nmcli may refuse to build the AP.")
 
+        self.report_radio_warnings()
+
         try:
             self.remove_existing_profile()
             configured = self.create_profile()
 
             if configured is None or configured.returncode != 0:
                 detail = configured.stderr.strip() if configured else "nmcli missing"
+                self.remove_existing_profile()
                 self.report_unavailable(detail)
                 return False
 
@@ -233,6 +273,7 @@ class AccessPointController:
 
         if raised is None or raised.returncode != 0:
             detail = raised.stderr.strip() if raised else "nmcli missing"
+            self.remove_existing_profile()
             self.report_unavailable(detail)
             return False
 
