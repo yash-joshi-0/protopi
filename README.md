@@ -36,7 +36,12 @@ After rebooting, check that `/dev/spidev0.0` exists, and `/dev/spidev1.0` if you
 
 4. Configure matrix rotation with `python max7219.py` (This only works for 14 matrix runs currently)
 
-Run `python max7219+screen.py` instead if you have the XFP111X status screen wired up. It falls back to the face alone when the screen is missing, and prints the `/dev/spidev` node it could not open.
+```bash
+python max7219.py            # face only
+python max7219.py --screen   # face plus the XFP111X status screen
+```
+
+The status screen is opt-in: without `--screen` the program never opens SPI1 at all, so you do not need the overlay or the screen wired up. With the flag it still falls back to the face alone when the screen is missing, and prints the `/dev/spidev` node it could not open.
 
 ---
 *This is a living document and will be updated with development*
