@@ -41,7 +41,7 @@ python max7219.py            # face only
 python max7219.py --screen   # face plus the XFP111X status screen
 ```
 
-The status screen is opt-in: without `--screen` the program never opens SPI1 at all, so you do not need the overlay or the screen wired up. With the flag it still falls back to the face alone when the screen is missing, and prints the `/dev/spidev` node it could not open.
+Without `--screen` the program never opens SPI1. With the flag it still falls back to the face alone when the screen is missing, and prints the `/dev/spidev` node it could not open.
 
 ---
 *This is a living document and will be updated with development*
