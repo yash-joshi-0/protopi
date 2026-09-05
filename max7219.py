@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import random
 import time
 from dataclasses import dataclass, field
@@ -8,9 +9,17 @@ from enum import IntEnum
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
+from luma.core.error import DeviceNotFoundError
 from luma.core.interface.serial import spi, noop
 from luma.core.render import canvas
 from luma.led_matrix.device import max7219
+
+try:
+    from luma.oled.device import sh1106
+except ImportError:  # pragma: no cover - optional dependency for non-OLED setups
+    sh1106 = None
+
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     import RPi.GPIO as GPIO
@@ -31,12 +40,21 @@ BUTTON_PIN = 27
 BUTTON_DEBOUNCE_MS = 50
 BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
 # Set this to GPIO.LOW if the button circuit is wired as active-low.
+STATUS_SCREEN_SPI_PORT = 1
+STATUS_SCREEN_SPI_DEVICE = 0
+STATUS_SCREEN_DC_PIN = 24
+STATUS_SCREEN_RST_PIN = 25
+STATUS_SCREEN_REFRESH_MS = 0
+STATUS_SCREEN_PROBE_INTERVAL_MS = 1000
+STATUS_SCREEN_BUS_SPEED_HZ = 4000000
 
 
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
 WIDTH = NUM_MATRICES * 8
 HEIGHT = 8
+STATUS_SCREEN_WIDTH = 128
+STATUS_SCREEN_HEIGHT = 64
 
 if GPIO is not None:
     BUTTON_PULL = GPIO.PUD_DOWN if BUTTON_ACTIVE_STATE == GPIO.HIGH else GPIO.PUD_UP
@@ -98,6 +116,7 @@ class Max7219FaceController:
         num_matrices: int = NUM_MATRICES,
         config_path: Path | None = None,
         button_debounce_ms: int = BUTTON_DEBOUNCE_MS,
+        use_status_screen: bool = True,
     ) -> None:
         self.num_matrices = num_matrices
         self.config_path = config_path or Path(__file__).resolve().with_name(
@@ -105,14 +124,38 @@ class Max7219FaceController:
         )
         self.width = num_matrices * 8
         self.height = 8
+        self.use_status_screen = use_status_screen
 
-        self.serial = spi(port=0, device=0, gpio=noop())
+        if GPIO is not None:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+
+        self.max7219_serial = spi(port=0, device=0, gpio=noop())
         self.device = max7219(
-            self.serial,
+            self.max7219_serial,
             cascaded=self.num_matrices,
             block_orientation=0,
         )
         self.device.contrast(1)
+
+        self.status_device = None
+        self.status_font = None
+        self.status_serial = None
+        self.status_last_update = 0.0
+        self.status_last_probe_attempt = 0.0
+        self.status_probe_interval_ms = STATUS_SCREEN_PROBE_INTERVAL_MS
+        self.status_refresh_ms = STATUS_SCREEN_REFRESH_MS
+        self._status_failure_reported = False
+
+        if self.use_status_screen and sh1106 is None:
+            print(
+                "Warning: luma.oled is not installed, continuing without the "
+                "status screen."
+            )
+            self.use_status_screen = False
+
+        if self.use_status_screen:
+            self._initialize_status_screen()
 
         self.matrix_configs: List[MatrixConfig] = []
         self.framebuffer = [[0] * self.width for _ in range(self.height)]
@@ -138,10 +181,141 @@ class Max7219FaceController:
         self._gpio_configured = False
 
         if GPIO is not None:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=BUTTON_PULL)
             self._gpio_configured = True
+
+    # Contract: Initialize the OLED status screen on the configured SPI chip select.
+    def _initialize_status_screen(self) -> bool:
+        if not self.use_status_screen:
+            return False
+
+        if GPIO is None:
+            self.use_status_screen = False
+            return False
+
+        try:
+            self.status_serial = spi(
+                port=STATUS_SCREEN_SPI_PORT,
+                device=STATUS_SCREEN_SPI_DEVICE,
+                gpio=GPIO,
+                gpio_DC=STATUS_SCREEN_DC_PIN,
+                gpio_RST=STATUS_SCREEN_RST_PIN,
+                bus_speed_hz=STATUS_SCREEN_BUS_SPEED_HZ,
+                reset_hold_time=0.2,
+                reset_release_time=0.2,
+            )
+            self.status_device = sh1106(
+                self.status_serial,
+                width=STATUS_SCREEN_WIDTH,
+                height=STATUS_SCREEN_HEIGHT,
+                rotate=0,
+            )
+            self.status_font = self.load_status_font()
+            self.blank_status_screen()
+        except (DeviceNotFoundError, FileNotFoundError, OSError) as error:
+            self.report_status_failure(error)
+            self.status_serial = None
+            self.status_device = None
+            self.status_font = None
+            return False
+
+        if self._status_failure_reported:
+            print(
+                f"Status screen reconnected on /dev/spidev"
+                f"{STATUS_SCREEN_SPI_PORT}.{STATUS_SCREEN_SPI_DEVICE}."
+            )
+            self._status_failure_reported = False
+
+        return True
+
+    # Contract: Report the first status screen failure and stay quiet while retrying.
+    def report_status_failure(self, error: Exception) -> None:
+        if self._status_failure_reported:
+            return
+
+        print(
+            f"Warning: no status screen on /dev/spidev"
+            f"{STATUS_SCREEN_SPI_PORT}.{STATUS_SCREEN_SPI_DEVICE} ({error}). "
+            f"The face keeps running; retrying every "
+            f"{self.status_probe_interval_ms} ms."
+        )
+        self._status_failure_reported = True
+
+    # Contract: Load the bitmap font for the status screen, or None when unavailable.
+    def load_status_font(self) -> ImageFont.ImageFont | None:
+        try:
+            return ImageFont.load_default()
+        except OSError:  # pragma: no cover - fallback when fonts are unavailable
+            return None
+
+    # Contract: Push an all-off frame to the status screen.
+    def blank_status_screen(self) -> None:
+        if self.status_device is None:
+            return
+
+        self.status_device.display(
+            Image.new("1", (STATUS_SCREEN_WIDTH, STATUS_SCREEN_HEIGHT), 0)
+        )
+
+    # Contract: Return the status lines, listing the face state plus whatever is active.
+    def get_status_lines(self) -> List[str]:
+        lines = [f"face_state={self.face_state.name}"]
+
+        if self.face_state == FaceState.BLINK:
+            lines.append("blink")
+
+        if self.boop:
+            lines.append("boop")
+
+        if self.reaction_phase:
+            lines.append(f"reaction_phase={self.reaction_phase}")
+
+        if self.mouth_step:
+            lines.append(f"mouth_step={self.mouth_step}")
+
+        return lines
+
+    # Contract: Draw the given lines into a status screen sized image.
+    def render_status_image(self, lines: List[str]) -> Image.Image:
+        image = Image.new("1", (STATUS_SCREEN_WIDTH, STATUS_SCREEN_HEIGHT), 0)
+        draw = ImageDraw.Draw(image)
+        text = "\n".join(lines)
+
+        if self.status_font is not None:
+            draw.text((0, 0), text, font=self.status_font, fill=1)
+        else:
+            draw.text((0, 0), text, fill=1)
+
+        return image
+
+    # Contract: Update the attached status screen with the current controller state.
+    def update_status_screen(self) -> None:
+        if not self.use_status_screen:
+            return
+
+        now = time.monotonic()
+        if self.status_device is None:
+            probe_interval_s = self.status_probe_interval_ms / 1000.0
+            if now - self.status_last_probe_attempt >= probe_interval_s:
+                self.status_last_probe_attempt = now
+                self._initialize_status_screen()
+            if self.status_device is None:
+                return
+
+        if now - self.status_last_update < (self.status_refresh_ms / 1000.0):
+            return
+
+        self.status_last_update = now
+
+        try:
+            self.status_device.display(
+                self.render_status_image(self.get_status_lines())
+            )
+        except OSError as error:
+            self.report_status_failure(error)
+            self.status_serial = None
+            self.status_device = None
+            self.status_font = None
 
     # Contract: Load per-matrix transforms from disk, skipping unusable lines.
     def load_matrix_config(self) -> None:
@@ -325,6 +499,7 @@ class Max7219FaceController:
         self.draw_mouth(mouth_step)
         self.draw_corner_markers()
         self.flush()
+        self.update_status_screen()
 
     # Contract: Refresh the display using the current face state.
     def redraw(self) -> None:
@@ -368,6 +543,7 @@ class Max7219FaceController:
         self.mouth_step = 0
         self.last_mouth_frame = time.monotonic()
         self.render_face(blink=True, mouth_step=0)
+        self.update_status_screen()
 
     # Contract: Prompt the user to calibrate matrix transforms and persist the result.
     def configure_matrices(self) -> None:
@@ -399,7 +575,11 @@ class Max7219FaceController:
             self.redraw()
 
             while True:
-                print(f"\rMatrix {module_index + 1}/{self.num_matrices}", end="", flush=True)
+                print(
+                    f"\rMatrix {module_index + 1}/{self.num_matrices}",
+                    end="",
+                    flush=True,
+                )
                 command = input(" > ").strip().lower()
 
                 matrix_config = self.matrix_configs[module_index]
@@ -439,10 +619,15 @@ class Max7219FaceController:
         print("--------------------------------------")
         print()
 
-    # Contract: Blank the display and release the GPIO channel this controller claimed.
+    # Contract: Blank every attached display and release the claimed GPIO channel.
     def shutdown(self) -> None:
         self.clear()
         self.flush()
+
+        try:
+            self.blank_status_screen()
+        except OSError as error:
+            print(f"Warning: could not blank the status screen: {error}")
 
         if GPIO is not None and self._gpio_configured:
             GPIO.cleanup(self.button_pin)
@@ -490,12 +675,28 @@ class Max7219FaceController:
                     self.face_state = FaceState.IDLE
                     self.redraw()
 
+                self.update_status_screen()
+
             time.sleep(0.005)
+
+
+# Contract: Parse the command line options for the entry point.
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Animate the Protogen face on the cascaded MAX7219 matrices."
+    )
+    parser.add_argument(
+        "--screen",
+        action="store_true",
+        help="also drive the XFP111X status screen wired to SPI1 CE0",
+    )
+    return parser.parse_args(argv)
 
 
 # Contract: Start the face controller from the entry point.
 def main() -> None:
-    controller = Max7219FaceController()
+    arguments = parse_arguments()
+    controller = Max7219FaceController(use_status_screen=arguments.screen)
 
     try:
         controller.run()
