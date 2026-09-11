@@ -1,0 +1,142 @@
+:root {
+  color-scheme: dark;
+  --background: #10121a;
+  --panel: #191d29;
+  --border: #2c3242;
+  --text: #e6e9f2;
+  --muted: #8f97ad;
+  --accent: #29bf12;
+  --error: #fe0b0b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1rem;
+  background: var(--background);
+  color: var(--text);
+  font-family: ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+h1 {
+  font-size: 1.1rem;
+  margin: 0;
+  letter-spacing: 0.08em;
+}
+
+.card {
+  max-width: 60rem;
+  margin: 0 auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+}
+
+.card.login {
+  max-width: 22rem;
+  margin-top: 12vh;
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.meta {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+label {
+  display: block;
+  margin-top: 0.75rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+input,
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+}
+
+input {
+  width: 100%;
+  margin-top: 0.25rem;
+}
+
+input:focus,
+button:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+button {
+  cursor: pointer;
+}
+
+button[disabled] {
+  color: var(--muted);
+  cursor: progress;
+}
+
+button.primary {
+  margin-top: 1rem;
+  width: 100%;
+  border-color: var(--accent);
+}
+
+.error {
+  color: var(--error);
+  margin: 0.75rem 0 0;
+}
+
+.output {
+  height: 60vh;
+  overflow: auto;
+  margin: 0;
+  padding: 0.75rem;
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.echo {
+  color: var(--accent);
+}
+
+.failure {
+  color: var(--error);
+}
+
+.working-directory {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
+}
+
+form.prompt {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+form.prompt input {
+  flex: 1;
+}

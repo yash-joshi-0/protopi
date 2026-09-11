@@ -3,7 +3,6 @@ ADMIN_USERNAME = "protogen"
 ADMIN_PASSWORD = "change-me-before-use"
 
 import hmac
-import html
 import json
 import os
 import secrets
@@ -18,7 +17,7 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 # User Values: These may need to be changed to match the Pi and the wireless setup.
 ACCESS_POINT_SSID = "ProtoPi"
@@ -33,6 +32,7 @@ CONSOLE_PORT = 8080
 SESSION_IDLE_TIMEOUT_MS = 900000
 COMMAND_TIMEOUT_MS = 20000
 NMCLI_TIMEOUT_MS = 30000
+REQUEST_TIMEOUT_MS = 15000
 LOGIN_ATTEMPT_LIMIT = 5
 LOGIN_LOCKOUT_MS = 60000
 CONSOLE_SHELL = "/bin/bash"
@@ -48,6 +48,20 @@ MAXIMUM_PASSPHRASE_LENGTH = 63
 MINIMUM_SSID_LENGTH = 1
 MAXIMUM_SSID_LENGTH = 32
 MAXIMUM_REQUEST_BYTES = 65536
+WEB_ROOT = Path(__file__).resolve().parent / "web"
+WEB_INDEX_NAME = "index.html"
+WEB_VENDOR_NAME = "vendor"
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
+WEB_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".jsx": "text/jsx; charset=utf-8",
+    ".svg": "image/svg+xml",
+}
+NO_STORE_CACHE_CONTROL = "no-store"
+VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable"
 PROTECTED_MANAGEMENT_FRAMES_DISABLED = "1"
 UNSET_REGULATORY_DOMAIN = "country 00:"
 TWO_GHZ_CHANNELS = range(1, 15)
@@ -108,6 +122,9 @@ def validate_settings() -> None:
 
     if not 1 <= CONSOLE_PORT <= 65535:
         raise SettingsError("CONSOLE_PORT must be between 1 and 65535.")
+
+    if not (WEB_ROOT / WEB_INDEX_NAME).is_file():
+        raise SettingsError(f"The console page is missing from {WEB_ROOT}.")
 
     if ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD:
         print("Warning: ADMIN_PASSWORD is still the shipped default; change it.")
@@ -404,6 +421,21 @@ class AdminConsoleServer(ThreadingHTTPServer):
             session.last_seen_ms = now_ms()
             return session
 
+    # Contract: Describe the session state the React console renders itself from.
+    def session_payload(self, session: ConsoleSession | None) -> dict:
+        if session is None:
+            return {"authenticated": False, "ssid": ACCESS_POINT_SSID}
+
+        return {
+            "authenticated": True,
+            "ssid": ACCESS_POINT_SSID,
+            "csrf_token": session.csrf_token,
+            "working_directory": session.working_directory,
+            "access_point_active": self.access_point.active,
+            "station_count": len(self.access_point.connected_stations()),
+            "command_timeout_seconds": COMMAND_TIMEOUT_MS // 1000,
+        }
+
     # Contract: Forget the session behind the given token.
     def end_session(self, token: str | None) -> None:
         if not token:
@@ -477,6 +509,8 @@ class AdminConsoleServer(ThreadingHTTPServer):
 class ConsoleRequestHandler(BaseHTTPRequestHandler):
     server_version = "ProtoPiConsole/1.0"
     protocol_version = "HTTP/1.1"
+    timeout = REQUEST_TIMEOUT_MS / 1000
+    request_body = b""
 
     # Contract: Print one compact line per request instead of the default log format.
     def log_message(self, format: str, *args) -> None:
@@ -518,10 +552,15 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
 
         if length > MAXIMUM_REQUEST_BYTES:
             print(f"Warning: discarding an oversized {length} byte request body.")
-            self.rfile.read(length)
+            self.close_connection = True
             return b""
 
-        return self.rfile.read(length)
+        try:
+            return self.rfile.read(length)
+        except OSError as error:
+            print(f"Warning: could not read the request body ({error}).")
+            self.close_connection = True
+            return b""
 
     # Contract: Send a complete response with the given body, status, and headers.
     def send_body(
@@ -530,11 +569,12 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         status: HTTPStatus = HTTPStatus.OK,
         content_type: str = "text/html; charset=utf-8",
         extra_headers: List[tuple[str, str]] | None = None,
+        cache_control: str = NO_STORE_CACHE_CONTROL,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
         self.send_header("X-Content-Type-Options", "nosniff")
 
         for name, value in extra_headers or []:
@@ -544,16 +584,28 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # Contract: Send a JSON payload to the client.
-    def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_body(body, status, "application/json; charset=utf-8")
-
-    # Contract: Send an empty redirect to the given path.
-    def send_redirect(
-        self, location: str, extra_headers: List[tuple[str, str]] | None = None
+    def send_json(
+        self,
+        payload: dict,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: List[tuple[str, str]] | None = None,
     ) -> None:
-        headers = [("Location", location), *(extra_headers or [])]
-        self.send_body(b"", HTTPStatus.SEE_OTHER, "text/plain; charset=utf-8", headers)
+        body = json.dumps(payload).encode("utf-8")
+        self.send_body(body, status, "application/json; charset=utf-8", extra_headers)
+
+    # Contract: Send the plain text not found response.
+    def send_not_found(self) -> None:
+        self.send_body(b"Not found", HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8")
+
+    # Contract: Parse the body read for this request, or None when unreadable.
+    def read_json_body(self) -> dict | None:
+        try:
+            parsed = json.loads(self.request_body.decode("utf-8", errors="replace"))
+        except ValueError as error:
+            print(f"Warning: unreadable JSON payload ({error}).")
+            return None
+
+        return parsed if isinstance(parsed, dict) else None
 
     # Contract: Build the Set-Cookie header that carries a session token.
     def session_cookie_header(
@@ -566,31 +618,43 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         )
         return ("Set-Cookie", value)
 
-    # Contract: Serve the login page or the console page depending on the session.
+    # Contract: Serve the session state or a file from the web directory.
     def do_GET(self) -> None:
         path = urlparse(self.path).path
 
-        if path != "/":
-            self.send_body(b"Not found", HTTPStatus.NOT_FOUND, "text/plain")
+        if path == "/api/session":
+            session = self.server.get_session(self.read_session_token())
+            self.send_json(self.server.session_payload(session))
             return
 
-        session = self.server.get_session(self.read_session_token())
+        self.send_web_file(path)
 
-        if session is None:
-            query = parse_qs(urlparse(self.path).query)
-            message = "Incorrect username or password." if "error" in query else ""
+    # Contract: Serve one file from the web directory, or 404 when it is not there.
+    def send_web_file(self, path: str) -> None:
+        target = resolve_web_file(path)
 
-            if "locked" in query:
-                message = f"Too many attempts. Wait {LOGIN_LOCKOUT_MS // 1000} seconds."
-
-            self.send_body(render_login_page(message).encode("utf-8"))
+        if target is None:
+            self.send_not_found()
             return
 
-        self.send_body(render_console_page(self.server, session).encode("utf-8"))
+        try:
+            body = target.read_bytes()
+        except OSError as error:
+            print(f"Warning: could not read {target.name} ({error}).")
+            self.send_not_found()
+            return
+
+        self.send_body(
+            body,
+            HTTPStatus.OK,
+            content_type_for(target),
+            cache_control=cache_control_for(target),
+        )
 
     # Contract: Route the login, logout, and command endpoints.
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        self.request_body = self.read_body()
 
         if path == "/login":
             self.handle_login()
@@ -599,31 +663,47 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         elif path == "/run":
             self.handle_run()
         else:
-            self.send_body(b"Not found", HTTPStatus.NOT_FOUND, "text/plain")
+            self.send_not_found()
 
     # Contract: Check submitted credentials and start a session when they match.
     def handle_login(self) -> None:
         if not self.server.login_allowed(self.remote_address):
-            self.send_redirect("/?locked")
+            seconds = LOGIN_LOCKOUT_MS // 1000
+            self.send_json(
+                {"error": f"Too many attempts. Wait {seconds} seconds."},
+                HTTPStatus.TOO_MANY_REQUESTS,
+            )
             return
 
-        fields = parse_qs(self.read_body().decode("utf-8", errors="replace"))
-        username = fields.get("username", [""])[0]
-        password = fields.get("password", [""])[0]
+        request = self.read_json_body()
+
+        if request is None:
+            self.send_json({"error": "Malformed request."}, HTTPStatus.BAD_REQUEST)
+            return
+
+        username = str(request.get("username", ""))
+        password = str(request.get("password", ""))
 
         if not self.server.credentials_match(username, password):
             self.server.record_failed_login(self.remote_address)
-            self.send_redirect("/?error")
+            self.send_json(
+                {"error": "Incorrect username or password."}, HTTPStatus.UNAUTHORIZED
+            )
             return
 
         session = self.server.create_session(self.remote_address)
-        self.send_redirect("/", [self.session_cookie_header(session.token)])
+        self.send_json(
+            self.server.session_payload(session),
+            extra_headers=[self.session_cookie_header(session.token)],
+        )
 
-    # Contract: End the current session and return the browser to the login page.
+    # Contract: End the current session and clear the cookie behind it.
     def handle_logout(self) -> None:
-        token = self.read_session_token()
-        self.server.end_session(token)
-        self.send_redirect("/", [self.session_cookie_header("", expire=True)])
+        self.server.end_session(self.read_session_token())
+        self.send_json(
+            self.server.session_payload(None),
+            extra_headers=[self.session_cookie_header("", expire=True)],
+        )
 
     # Contract: Run one submitted command for an authenticated session.
     def handle_run(self) -> None:
@@ -637,10 +717,9 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "Bad request token."}, HTTPStatus.FORBIDDEN)
             return
 
-        try:
-            request = json.loads(self.read_body().decode("utf-8", errors="replace"))
-        except ValueError as error:
-            print(f"Warning: unreadable command payload ({error}).")
+        request = self.read_json_body()
+
+        if request is None:
             self.send_json({"error": "Malformed request."}, HTTPStatus.BAD_REQUEST)
             return
 
@@ -654,32 +733,29 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         self.send_json(self.server.run_command(session, command))
 
 
-# Contract: Render the login page, showing the given message when one is present.
-def render_login_page(message: str) -> str:
-    banner = f'<p class="error">{html.escape(message)}</p>' if message else ""
-    return LOGIN_PAGE_TEMPLATE.format(
-        style=CONSOLE_STYLE,
-        ssid=html.escape(ACCESS_POINT_SSID),
-        banner=banner,
-    )
+# Contract: Return the file under the web directory a request path names.
+def resolve_web_file(path: str) -> Path | None:
+    relative = path.lstrip("/") or WEB_INDEX_NAME
+    candidate = (WEB_ROOT / relative).resolve()
+
+    if not candidate.is_relative_to(WEB_ROOT):
+        print(f"Warning: refused a request for {path} outside the web directory.")
+        return None
+
+    return candidate if candidate.is_file() else None
 
 
-# Contract: Render the console page for a signed-in session.
-def render_console_page(server: AdminConsoleServer, session: ConsoleSession) -> str:
-    station_count = len(server.access_point.connected_stations())
-    access_point_state = "up" if server.access_point.active else "off"
+# Contract: Return the content type that follows from a served file's suffix.
+def content_type_for(target: Path) -> str:
+    return WEB_CONTENT_TYPES.get(target.suffix, DEFAULT_CONTENT_TYPE)
 
-    return CONSOLE_PAGE_TEMPLATE.format(
-        style=CONSOLE_STYLE,
-        script=CONSOLE_SCRIPT,
-        ssid=html.escape(ACCESS_POINT_SSID),
-        access_point_state=access_point_state,
-        station_count=station_count,
-        csrf_header=CSRF_HEADER_NAME,
-        csrf_token=html.escape(session.csrf_token),
-        working_directory=html.escape(session.working_directory),
-        timeout_seconds=COMMAND_TIMEOUT_MS // 1000,
-    )
+
+# Contract: Cache the pinned vendor libraries, but never the files you edit.
+def cache_control_for(target: Path) -> str:
+    if target.parent.name == WEB_VENDOR_NAME:
+        return VENDOR_CACHE_CONTROL
+
+    return NO_STORE_CACHE_CONTROL
 
 
 # Contract: Start the hotspot, serve the admin console, and clean both up on exit.
@@ -710,208 +786,6 @@ def main() -> None:
         server.shutdown()
         server.server_close()
         access_point.shutdown()
-
-
-CONSOLE_STYLE = """
-:root {
-  color-scheme: dark;
-  --background: #10121a;
-  --panel: #191d29;
-  --border: #2c3242;
-  --text: #e6e9f2;
-  --muted: #8f97ad;
-  --accent: #29bf12;
-  --error: #fe0b0b;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  padding: 1rem;
-  background: var(--background);
-  color: var(--text);
-  font-family: ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace;
-  font-size: 15px;
-  line-height: 1.45;
-}
-h1 { font-size: 1.1rem; margin: 0; letter-spacing: 0.08em; }
-.card {
-  max-width: 60rem;
-  margin: 0 auto;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1rem;
-}
-.login { max-width: 22rem; margin-top: 12vh; }
-header {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem 1rem;
-  align-items: baseline;
-  justify-content: space-between;
-  margin-bottom: 0.75rem;
-}
-.meta { color: var(--muted); font-size: 0.8rem; }
-label { display: block; margin-top: 0.75rem; color: var(--muted); font-size: 0.8rem; }
-input, button {
-  font: inherit;
-  color: var(--text);
-  background: var(--background);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.5rem 0.6rem;
-}
-input { width: 100%; margin-top: 0.25rem; }
-input:focus, button:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-button { cursor: pointer; }
-button.primary { margin-top: 1rem; width: 100%; border-color: var(--accent); }
-.error { color: var(--error); margin: 0.75rem 0 0; }
-#output {
-  height: 60vh;
-  overflow: auto;
-  margin: 0;
-  padding: 0.75rem;
-  background: var(--background);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.exit-fail { color: var(--error); }
-.echo { color: var(--accent); }
-form.prompt { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
-form.prompt input { flex: 1; }
-#cwd { color: var(--muted); font-size: 0.8rem; margin-top: 0.5rem; }
-"""
-
-LOGIN_PAGE_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ProtoPi admin</title>
-<style>{style}</style>
-</head>
-<body>
-<main class="card login">
-<h1>PROTOPI ADMIN</h1>
-<p class="meta">{ssid}</p>
-<form method="post" action="/login">
-<label for="username">Username</label>
-<input id="username" name="username" autocomplete="username" autofocus>
-<label for="password">Password</label>
-<input id="password" name="password" type="password" autocomplete="current-password">
-<button class="primary" type="submit">Sign in</button>
-</form>
-{banner}
-</main>
-</body>
-</html>
-"""
-
-CONSOLE_PAGE_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ProtoPi console</title>
-<style>{style}</style>
-</head>
-<body data-csrf-header="{csrf_header}" data-csrf-token="{csrf_token}">
-<main class="card">
-<header>
-<h1>PROTOPI CONSOLE</h1>
-<span class="meta">{ssid} &middot; ap {access_point_state} &middot;
-clients {station_count} &middot; timeout {timeout_seconds}s</span>
-<form method="post" action="/logout"><button type="submit">Sign out</button></form>
-</header>
-<pre id="output">Type a command and press Enter. Arrow keys walk the history.
-</pre>
-<div id="cwd">{working_directory}</div>
-<form class="prompt" id="prompt">
-<input id="command" autocomplete="off" autocapitalize="off" spellcheck="false"
- placeholder="command" autofocus>
-<button type="submit">Run</button>
-</form>
-</main>
-<script>{script}</script>
-</body>
-</html>
-"""
-
-CONSOLE_SCRIPT = """
-const outputPane = document.getElementById("output");
-const commandInput = document.getElementById("command");
-const promptForm = document.getElementById("prompt");
-const workingDirectory = document.getElementById("cwd");
-const csrfHeader = document.body.dataset.csrfHeader;
-const csrfToken = document.body.dataset.csrfToken;
-const history = [];
-let historyIndex = 0;
-
-function appendLine(text, className) {
-  const line = document.createElement("span");
-  if (className) { line.className = className; }
-  line.textContent = text.endsWith("\\n") ? text : text + "\\n";
-  outputPane.appendChild(line);
-  outputPane.scrollTop = outputPane.scrollHeight;
-}
-
-async function runCommand(command) {
-  appendLine("$ " + command, "echo");
-  let response;
-  try {
-    response = await fetch("/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", [csrfHeader]: csrfToken },
-      body: JSON.stringify({ command: command })
-    });
-  } catch (error) {
-    appendLine("Console unreachable: " + error, "exit-fail");
-    return;
-  }
-  if (response.status === 401) {
-    appendLine("Session expired. Reloading...", "exit-fail");
-    window.location.reload();
-    return;
-  }
-  const result = await response.json();
-  if (result.error) {
-    appendLine(result.error, "exit-fail");
-    return;
-  }
-  if (result.output) { appendLine(result.output); }
-  if (result.exit_code !== 0) {
-    appendLine("[exit " + result.exit_code + "]", "exit-fail");
-  }
-  workingDirectory.textContent = result.working_directory;
-}
-
-promptForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const command = commandInput.value.trim();
-  if (!command) { return; }
-  if (command === "clear") {
-    outputPane.textContent = "";
-    commandInput.value = "";
-    return;
-  }
-  history.push(command);
-  historyIndex = history.length;
-  commandInput.value = "";
-  await runCommand(command);
-  commandInput.focus();
-});
-
-commandInput.addEventListener("keydown", (event) => {
-  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") { return; }
-  if (history.length === 0) { return; }
-  event.preventDefault();
-  historyIndex += event.key === "ArrowUp" ? -1 : 1;
-  historyIndex = Math.max(0, Math.min(history.length, historyIndex));
-  commandInput.value = history[historyIndex] || "";
-});
-"""
 
 
 if __name__ == "__main__":

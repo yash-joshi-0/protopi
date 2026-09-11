@@ -1,0 +1,52 @@
+#!/bin/sh
+# Pre-commit hook: compile every script, then run the test suites.
+# A failure here aborts the commit. Install it once with:
+#   git config core.hooksPath tests/hooks
+# Override the interpreter with PROTOPI_PYTHON when the default is not the one
+# the project runs on.
+
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+if [ -n "$PROTOPI_PYTHON" ]; then
+    PYTHON="$PROTOPI_PYTHON"
+elif [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    PYTHON="$VIRTUAL_ENV/bin/python"
+elif [ -x ".venv/bin/python" ]; then
+    PYTHON=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON="python3"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON="python"
+else
+    echo "pre-commit: no python interpreter found; set PROTOPI_PYTHON." >&2
+    exit 1
+fi
+
+echo "pre-commit: using $PYTHON"
+
+for script in max7219.py access_point.py tests/test_screen.py tests/test_console.py; do
+    if [ -f "$script" ]; then
+        echo "pre-commit: compiling $script"
+
+        if ! "$PYTHON" -m py_compile "$script"; then
+            echo "pre-commit: $script does not compile; commit aborted." >&2
+            exit 1
+        fi
+    fi
+done
+
+for suite in tests/test_screen.py tests/test_console.py; do
+    if [ -f "$suite" ]; then
+        echo "pre-commit: running $suite"
+
+        if ! "$PYTHON" "$suite"; then
+            echo "pre-commit: $suite failed; commit aborted." >&2
+            exit 1
+        fi
+    fi
+done
+
+echo "pre-commit: all checks passed"
