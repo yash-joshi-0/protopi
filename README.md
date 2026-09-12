@@ -7,7 +7,7 @@
 |HUB75 Support    | ![static badge](https://img.shields.io/badge/Not%20Started-FE0B0B)  |
 |Wireless Access Point    | ![static badge](https://img.shields.io/badge/In%20Progress-F0C808)  |
 |Admin Console    | ![static badge](https://img.shields.io/badge/In%20Progress-F0C808)  |
-|Config/Communicate Page    | ![static badge](https://img.shields.io/badge/Not%20Started-FE0B0B)  |
+|Config/Communicate Page    | ![static badge](https://img.shields.io/badge/In%20Progress-F0C808)  |
 
 ### How to use:
 1. `git clone` into folder of your choice.
@@ -46,29 +46,50 @@ Without `--screen` the program never opens SPI1. With the flag it still falls ba
 
 ### Wireless access point and admin console
 
-`access_point.py` turns the Pi's own Wi-Fi into a hotspot and serves a password-protected web console on it, so you can run shell commands on the suit from a phone without a keyboard or an SSH client.
+`access_point.py` turns the Pi's Wi-Fi into a hotspot and serves a chat at `/` and a password-protected admin console at `/admin` for running shell commands on the suit from a phone without a keyboard or an SSH client.
 
 1. Set the login at the very top of the file. The first two lines after the shebang are `ADMIN_USERNAME` and `ADMIN_PASSWORD`; the hotspot SSID, passphrase, interface, channel, address, and port follow under `# User Values:`.
 2. Start it as root, since NetworkManager will not build an AP profile otherwise:
 ```bash
 sudo python access_point.py
 ```
-3. Join the `ProtoPi` network from your phone with `ACCESS_POINT_PASSPHRASE`, then open `http://192.168.4.1:8080/` and sign in.
+3. Join the `ProtoPi` network from your phone with `ACCESS_POINT_PASSPHRASE`, then open `http://192.168.4.1:8080/` for the chat, or `http://192.168.4.1:8080/admin` to sign in to the console.
 
 The console keeps one working directory per login, so `cd` carries between commands. Sessions idle out after 15 minutes, five bad logins lock a client out for a minute, and commands are killed after 20 seconds. Ctrl+C kills the hotspot and deletes the `protopi-ap` profile it created.
 
 The AP needs NetworkManager (the default on Raspberry Pi OS Bookworm and later) with `nmcli` on the path, and the Wi-Fi radio cannot be joined to another network at the same time. If `nmcli` is missing or refuses, the script says so and still serves the console on every interface, so it stays usable over Ethernet or an existing Wi-Fi connection.
+
+### Chat
+
+Messages are stored in `chat.db`, a SQLite file created beside `access_point.py` on first run and ignored by git. One table:
+
+```sql
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    body TEXT NOT NULL,
+    sent_at_ms INTEGER NOT NULL
+)
+```
+
+The page asks for the newest `CHAT_HISTORY_LIMIT` messages and the server refuses a message longer than `MAXIMUM_MESSAGE_LENGTH` or a name longer than `MAXIMUM_USERNAME_LENGTH`; all three are under `# Configuration values:`. Delete `chat.db` to clear the history.
+
+The chat is unauthenticated, so there is no way to stop anyone from sending anything, but it is covered to prevent SQL injection and the like.
 
 The console page lives in [`web/`](web/) and is a React app written in JSX, one component per file:
 
 ```
 web/
 ├── index.html                     loads the stylesheet, the vendor scripts, then each component
-├── console.css                    every style the page uses
+├── console.css                    every style both pages use
 ├── api.js                         fetch helpers shared by the components
 ├── main.jsx                       mounts <App /> into #root
 ├── components/
-│   ├── App.jsx                    picks the login card or the console
+│   ├── App.jsx                    routes on the address bar: /admin or the chat
+│   ├── ChatPage.jsx               the main screen, holds the messages and polls
+│   ├── ChatForm.jsx               name and message boxes, remembers the name
+│   ├── MessageList.jsx            the stored messages with their times
+│   ├── AdminPage.jsx              login card until signed in, then the console
 │   ├── LoginCard.jsx              username, password, error message
 │   ├── ConsoleCard.jsx            owns the transcript and runs commands
 │   ├── ConsoleStatus.jsx          the ssid / ap / clients line in the header
@@ -79,7 +100,7 @@ web/
 
 There is no build step. Babel compiles the JSX in the browser, so all edits are live and update on reload.
 
-`access_point.py` serves that directory as static files and answers `/api/session`, `/login`, `/logout`, and `/run` as JSON.
+`access_point.py` serves that directory as static files, serves the page itself for `/` and `/admin`, and answers `/api/messages`, `/api/session`, `/login`, `/logout`, and `/run` as JSON.
 
 Components are plain `function` declarations loaded as ordinary scripts, not ES modules, so there are no imports between them. A new component needs a `<script type="text/babel">` line in `index.html`, listed before whatever uses it.
 
@@ -87,7 +108,7 @@ Components are plain `function` declarations loaded as ordinary scripts, not ES 
 
 ```bash
 python tests/test_screen.py     # face and status screen, with fake hardware
-python tests/test_console.py    # access point settings, console API, React render
+python tests/test_console.py    # access point, chat database, console API, React render
 ```
 
 Both run without the Pi. `test_console.py` starts a console on a loopback port, compiles every `.jsx` file with the vendored Babel when Node is installed, and renders the page in headless Chromium or Edge. Each of those two groups skips itself when its tool is missing, so the suite still passes on a bare Pi.

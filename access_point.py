@@ -8,6 +8,7 @@ import os
 import secrets
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -36,6 +37,9 @@ REQUEST_TIMEOUT_MS = 15000
 LOGIN_ATTEMPT_LIMIT = 5
 LOGIN_LOCKOUT_MS = 60000
 CONSOLE_SHELL = "/bin/bash"
+CHAT_HISTORY_LIMIT = 100
+MAXIMUM_USERNAME_LENGTH = 32
+MAXIMUM_MESSAGE_LENGTH = 500
 
 # Constants: These should not need to be changed.
 CONNECTION_NAME = "protopi-ap"
@@ -51,6 +55,21 @@ MAXIMUM_REQUEST_BYTES = 65536
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 WEB_INDEX_NAME = "index.html"
 WEB_VENDOR_NAME = "vendor"
+APP_ROUTES = ("/", "/admin")
+CHAT_DATABASE_PATH = Path(__file__).resolve().parent / "chat.db"
+CHAT_DATABASE_TIMEOUT_MS = 5000
+CREATE_MESSAGES_TABLE = """
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    body TEXT NOT NULL,
+    sent_at_ms INTEGER NOT NULL
+)
+"""
+INSERT_MESSAGE = "INSERT INTO messages (username, body, sent_at_ms) VALUES (?, ?, ?)"
+SELECT_RECENT_MESSAGES = (
+    "SELECT id, username, body, sent_at_ms FROM messages ORDER BY id DESC LIMIT ?"
+)
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 WEB_CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
@@ -128,6 +147,66 @@ def validate_settings() -> None:
 
     if ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD:
         print("Warning: ADMIN_PASSWORD is still the shipped default; change it.")
+
+
+# Class: ChatStore keeps the chat messages in a SQLite file beside the script.
+class ChatStore:
+    # Contract: Remember where the database lives and create its table if needed.
+    def __init__(self, database_path: Path = CHAT_DATABASE_PATH) -> None:
+        self.database_path = database_path
+        self.write_lock = threading.Lock()
+        self.create_table()
+
+    # Contract: Open a connection for the calling thread.
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.database_path, timeout=CHAT_DATABASE_TIMEOUT_MS / 1000
+        )
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    # Contract: Create the message table when the database file is new.
+    def create_table(self) -> None:
+        connection = self.connect()
+
+        try:
+            with connection:
+                connection.execute(CREATE_MESSAGES_TABLE)
+        finally:
+            connection.close()
+
+    # Contract: Store one message and return it the way the page shows it.
+    def add_message(self, username: str, body: str) -> dict:
+        sent_at_ms = int(time.time() * 1000)
+        connection = self.connect()
+
+        try:
+            with self.write_lock:
+                with connection:
+                    cursor = connection.execute(
+                        INSERT_MESSAGE, (username, body, sent_at_ms)
+                    )
+                    message_id = cursor.lastrowid
+        finally:
+            connection.close()
+
+        return {
+            "id": message_id,
+            "username": username,
+            "body": body,
+            "sent_at_ms": sent_at_ms,
+        }
+
+    # Contract: Return the newest messages, oldest first, as the page reads them.
+    def recent_messages(self, limit: int = CHAT_HISTORY_LIMIT) -> List[dict]:
+        connection = self.connect()
+
+        try:
+            rows = connection.execute(SELECT_RECENT_MESSAGES, (limit,)).fetchall()
+        finally:
+            connection.close()
+
+        return [dict(row) for row in reversed(rows)]
 
 
 # Class: AccessPointController drives the NetworkManager hotspot on the Pi.
@@ -347,9 +426,11 @@ class AdminConsoleServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         handler_class: type,
         access_point: AccessPointController,
+        chat_store: ChatStore | None = None,
     ) -> None:
         super().__init__(server_address, handler_class)
         self.access_point = access_point
+        self.chat_store = chat_store or ChatStore()
         self.sessions: Dict[str, ConsoleSession] = {}
         self.throttles: Dict[str, LoginThrottle] = {}
         self.state_lock = threading.Lock()
@@ -627,7 +708,80 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json(self.server.session_payload(session))
             return
 
+        if path == "/api/messages":
+            self.handle_read_messages()
+            return
+
+        if path in APP_ROUTES:
+            self.send_web_file(f"/{WEB_INDEX_NAME}")
+            return
+
         self.send_web_file(path)
+
+    # Contract: Send the recent chat messages to anyone on the network.
+    def handle_read_messages(self) -> None:
+        try:
+            messages = self.server.chat_store.recent_messages()
+        except sqlite3.Error as error:
+            print(f"Warning: could not read the chat history ({error}).")
+            self.send_json(
+                {"error": "The chat history is unavailable."},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        self.send_json(
+            {
+                "messages": messages,
+                "maximum_username_length": MAXIMUM_USERNAME_LENGTH,
+                "maximum_message_length": MAXIMUM_MESSAGE_LENGTH,
+            }
+        )
+
+    # Contract: Store one chat message from the page, refusing unusable input.
+    def handle_send_message(self) -> None:
+        request = self.read_json_body()
+
+        if request is None:
+            self.send_json({"error": "Malformed request."}, HTTPStatus.BAD_REQUEST)
+            return
+
+        username = str(request.get("username", "")).strip()
+        body = str(request.get("body", "")).strip()
+
+        if not username or not body:
+            self.send_json(
+                {"error": "A username and a message are both needed."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        if len(username) > MAXIMUM_USERNAME_LENGTH:
+            self.send_json(
+                {"error": f"Keep the username under {MAXIMUM_USERNAME_LENGTH}."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        if len(body) > MAXIMUM_MESSAGE_LENGTH:
+            self.send_json(
+                {"error": f"Keep the message under {MAXIMUM_MESSAGE_LENGTH}."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        try:
+            message = self.server.chat_store.add_message(username, body)
+        except sqlite3.Error as error:
+            print(f"Warning: could not store a chat message ({error}).")
+            self.send_json(
+                {"error": "The message could not be saved."},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        print(f"{self.remote_address} chat from {username}.")
+        self.send_json({"message": message}, HTTPStatus.CREATED)
 
     # Contract: Serve one file from the web directory, or 404 when it is not there.
     def send_web_file(self, path: str) -> None:
@@ -662,6 +816,8 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             self.handle_logout()
         elif path == "/run":
             self.handle_run()
+        elif path == "/api/messages":
+            self.handle_send_message()
         else:
             self.send_not_found()
 
@@ -766,15 +922,22 @@ def main() -> None:
         print(f"Cannot start: {error}")
         return
 
+    try:
+        chat_store = ChatStore()
+    except sqlite3.Error as error:
+        print(f"Cannot start: the chat database could not be opened ({error}).")
+        return
+
     access_point = AccessPointController()
     access_point.start()
 
     bind_address = ACCESS_POINT_ADDRESS if access_point.active else "0.0.0.0"
     server = AdminConsoleServer(
-        (bind_address, CONSOLE_PORT), ConsoleRequestHandler, access_point
+        (bind_address, CONSOLE_PORT), ConsoleRequestHandler, access_point, chat_store
     )
 
-    print(f"Admin console on http://{bind_address}:{CONSOLE_PORT}/")
+    print(f"Chat on http://{bind_address}:{CONSOLE_PORT}/")
+    print(f"Admin console on http://{bind_address}:{CONSOLE_PORT}/admin")
     print(f"Sign in as '{ADMIN_USERNAME}'. Press Ctrl+C to stop.")
 
     try:

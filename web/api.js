@@ -15,11 +15,26 @@ async function sendJson(path, body, token) {
   return { status: response.status, payload: await response.json() };
 }
 
+// Contract: Read JSON from one of the GET endpoints.
+async function readJson(path) {
+  const response = await fetch(path, { headers: { Accept: "application/json" } });
+  return response.json();
+}
+
 // Contract: Read the current session state from the server.
 async function readSession() {
-  const response = await fetch("/api/session", {
-    headers: { Accept: "application/json" },
-  });
+  return readJson("/api/session");
+}
 
-  return response.json();
+// Contract: Read the stored chat messages, oldest first.
+async function readMessages() {
+  return readJson("/api/messages");
+}
+
+// Contract: Format a stored timestamp as a short local clock time.
+function formatSentAt(sentAtMs) {
+  return new Date(sentAtMs).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }

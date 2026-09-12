@@ -26,6 +26,10 @@ WEB_FILES = [
     "/api.js",
     "/main.jsx",
     "/components/App.jsx",
+    "/components/AdminPage.jsx",
+    "/components/ChatForm.jsx",
+    "/components/ChatPage.jsx",
+    "/components/MessageList.jsx",
     "/components/LoginCard.jsx",
     "/components/ConsoleCard.jsx",
     "/components/ConsoleStatus.jsx",
@@ -35,11 +39,16 @@ WEB_FILES = [
     "/vendor/react-dom.production.min.js",
     "/vendor/babel.min.js",
 ]
+APP_ROUTES = ("/", "/admin")
 COMPONENT_NAMES = [
+    "AdminPage",
     "App",
+    "ChatForm",
+    "ChatPage",
     "ConsoleCard",
     "ConsoleStatus",
     "LoginCard",
+    "MessageList",
     "OutputPane",
     "PromptForm",
 ]
@@ -63,6 +72,7 @@ BROWSER_CANDIDATES = [
 BROWSER_TIMEOUT_MS = 60000
 BROWSER_VIRTUAL_TIME_MS = 20000
 SHORT_COMMAND_TIMEOUT_MS = 1500
+ROOT_ELEMENT_MARKER = '<div id="root">'
 JSX_COMPILE_SCRIPT = r"""
 const fs = require("fs");
 const Babel = require("./web/vendor/babel.min.js");
@@ -195,12 +205,13 @@ class ConsoleClient:
 
 
 # Contract: Start an admin console on a free port and return the server and client.
-def start_console(handler_class=None):
+def start_console(handler_class=None, chat_store=None):
     controller = access_point.AccessPointController()
     server = access_point.AdminConsoleServer(
         ("127.0.0.1", 0),
         handler_class or access_point.ConsoleRequestHandler,
         controller,
+        chat_store or access_point.ChatStore(Path(tempfile.mkdtemp()) / "chat.db"),
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, ConsoleClient(server.server_address[1])
@@ -651,6 +662,110 @@ def check_connection_reuse(recorder: CheckRecorder) -> None:
         stop_console(server)
 
 
+# Contract: Check the chat stores messages, reads them back, and refuses bad input.
+def check_chat_api(recorder: CheckRecorder) -> None:
+    database = Path(tempfile.mkdtemp()) / "chat.db"
+    store = access_point.ChatStore(database)
+    server, client = start_console(chat_store=store)
+
+    try:
+        status, payload, _ = client.json_request("/api/messages")
+        recorder.check("chat starts empty", payload.get("messages") == [], f"{status}")
+        recorder.check(
+            "chat reports the limits it enforces",
+            payload.get("maximum_username_length")
+            == access_point.MAXIMUM_USERNAME_LENGTH,
+        )
+
+        status, payload, _ = client.json_request(
+            "/api/messages", {"username": "Kade", "body": "hello suit"}
+        )
+        recorder.check(
+            "a message is accepted", status == HTTPStatus.CREATED, f"{status}"
+        )
+        message = payload.get("message", {})
+        recorder.check(
+            "the stored message comes back", message.get("body") == "hello suit"
+        )
+        recorder.check(
+            "the message is timed", isinstance(message.get("sent_at_ms"), int)
+        )
+
+        client.json_request("/api/messages", {"username": "Vex", "body": "boop"})
+        status, payload, _ = client.json_request("/api/messages")
+        stored = payload.get("messages", [])
+        recorder.check("both messages are stored", len(stored) == 2, f"{len(stored)}")
+        recorder.check(
+            "messages come back oldest first",
+            [item["body"] for item in stored] == ["hello suit", "boop"],
+        )
+        recorder.check("messages keep their sender", stored[1]["username"] == "Vex")
+
+        refusals = {
+            "a blank message is refused": {"username": "Kade", "body": "   "},
+            "a blank username is refused": {"username": "", "body": "hi"},
+            "a long username is refused": {
+                "username": "z" * (access_point.MAXIMUM_USERNAME_LENGTH + 1),
+                "body": "hi",
+            },
+            "a long message is refused": {
+                "username": "Kade",
+                "body": "z" * (access_point.MAXIMUM_MESSAGE_LENGTH + 1),
+            },
+        }
+
+        for label, payload_body in refusals.items():
+            status, payload, _ = client.json_request("/api/messages", payload_body)
+            recorder.check(label, status == HTTPStatus.BAD_REQUEST, f"{status}")
+
+        status, payload, _ = client.json_request("/api/messages")
+        recorder.check(
+            "refused messages are not stored", len(payload.get("messages", [])) == 2
+        )
+
+        recorder.check(
+            "the chat needs no login",
+            "csrf_token" not in payload and payload.get("messages") is not None,
+        )
+    finally:
+        stop_console(server)
+
+    reopened = access_point.ChatStore(database)
+    recorder.check("messages survive a restart", len(reopened.recent_messages()) == 2)
+    recorder.check(
+        "the history is capped",
+        len(reopened.recent_messages(limit=1)) == 1,
+    )
+
+
+# Contract: Check the chat and the admin console answer on their own routes.
+def check_page_routes(recorder: CheckRecorder) -> None:
+    server, client = start_console()
+
+    try:
+        for path in APP_ROUTES:
+            status, headers, body = client.request(path)
+            recorder.check(
+                f"{path} serves the page", status == HTTPStatus.OK, f"{status}"
+            )
+            recorder.check(f"{path} is the app shell", b'id="root"' in body)
+            recorder.check(
+                f"{path} is served as html",
+                "text/html" in headers.get("Content-Type", ""),
+            )
+
+        status, _, _ = client.request("/admin/nope")
+        recorder.check("an unknown route is still 404", status == HTTPStatus.NOT_FOUND)
+
+        app_source = (access_point.WEB_ROOT / "components" / "App.jsx").read_text(
+            encoding="utf-8"
+        )
+        recorder.check("the router knows the admin path", '"/admin"' in app_source)
+        recorder.check("the router falls back to the chat", "ChatPage" in app_source)
+    finally:
+        stop_console(server)
+
+
 # Contract: Check repeated bad logins lock a client out instead of allowing guessing.
 def check_login_lockout(recorder: CheckRecorder) -> None:
     server, client = start_console()
@@ -753,30 +868,56 @@ def check_browser_render(recorder: CheckRecorder) -> None:
         recorder.skip("browser render", "no Chromium based browser found")
         return
 
-    server, client = start_console(build_autologin_handler())
+    database = Path(tempfile.mkdtemp()) / "chat.db"
+    store = access_point.ChatStore(database)
+    store.add_message("Vex", "stored before the browser opened")
+    server, client = start_console(build_autologin_handler(), store)
 
     try:
-        login_dom = render_page(browser, f"{client.base}/")
+        chat_root = extract_root(render_page(browser, f"{client.base}/"))
+        recorder.check("React renders the chat on /", "PROTOPI CHAT" in chat_root)
+        recorder.check("the chat shows its form", "chat-form" in chat_root)
         recorder.check(
-            "React renders the login card",
-            login_dom is not None and "PROTOPI ADMIN" in login_dom,
+            "the chat shows a stored message",
+            "stored before the browser opened" in chat_root,
         )
+        recorder.check("the chat names the sender", "Vex" in chat_root)
+        recorder.check("the chat links to the console", 'href="/admin"' in chat_root)
         recorder.check(
-            "login card asks for a password",
-            login_dom is not None and 'type="password"' in login_dom,
+            "the chat is not the login card", "PROTOPI ADMIN" not in chat_root
         )
 
-        console_dom = render_page(browser, f"{client.base}/auto-login")
+        login_root = extract_root(render_page(browser, f"{client.base}/admin"))
         recorder.check(
-            "React renders the console after login",
-            console_dom is not None and "PROTOPI CONSOLE" in console_dom,
+            "React renders the login card on /admin", "PROTOPI ADMIN" in login_root
         )
         recorder.check(
-            "console shows a prompt",
-            console_dom is not None and 'class="prompt"' in console_dom,
+            "login card asks for a password", 'type="password"' in login_root
         )
+        recorder.check("the login card is not the chat", "chat-form" not in login_root)
+
+        console_root = extract_root(render_page(browser, f"{client.base}/auto-login"))
+        recorder.check(
+            "React renders the console after login", "PROTOPI CONSOLE" in console_root
+        )
+        recorder.check("console shows a prompt", 'class="prompt"' in console_root)
     finally:
         stop_console(server)
+
+
+# Contract: Return what React rendered into the root element, ignoring the scripts.
+def extract_root(dom: str | None) -> str:
+    if dom is None:
+        return ""
+
+    opening = dom.find(ROOT_ELEMENT_MARKER)
+
+    if opening < 0:
+        return ""
+
+    start = opening + len(ROOT_ELEMENT_MARKER)
+    end = dom.find("<script", start)
+    return dom[start:end] if end > start else dom[start:]
 
 
 # Contract: Build a handler that signs itself in, for driving the app in a browser.
@@ -787,7 +928,7 @@ def build_autologin_handler():
         "headers:{'Content-Type':'application/json'},"
         f"body: JSON.stringify({{username:'{TEST_USERNAME}',"
         f"password:'{TEST_PASSWORD}'}})"
-        "}).then(() => { window.location = '/'; });"
+        "}).then(() => { window.location = '/admin'; });"
         "</script></body>"
     ).encode("utf-8")
 
@@ -845,6 +986,8 @@ def main() -> int:
     check_static_serving(recorder)
     check_session_api(recorder)
     check_command_guards(recorder)
+    check_chat_api(recorder)
+    check_page_routes(recorder)
     check_connection_reuse(recorder)
     check_login_lockout(recorder)
     check_command_execution(recorder)
