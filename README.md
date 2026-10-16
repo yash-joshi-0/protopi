@@ -57,7 +57,17 @@ sudo python access_point.py
 
 The console keeps one working directory per login, so `cd` carries between commands. Sessions idle out after 15 minutes, five bad logins lock a client out for a minute, and commands are killed after 20 seconds. Ctrl+C kills the hotspot and deletes the `protopi-ap` profile it created.
 
-The AP needs NetworkManager (the default on Raspberry Pi OS Bookworm and later) with `nmcli` on the path, and the Wi-Fi radio cannot be joined to another network at the same time. If `nmcli` is missing or refuses, the script says so and still serves the console on every interface, so it stays usable over Ethernet or an existing Wi-Fi connection.
+The AP needs NetworkManager (the default on Raspberry Pi OS Bookworm and later) with `nmcli` on the path, and the Wi-Fi radio hosting it cannot be joined to another network at the same time. If `nmcli` is missing or refuses, the script says so and still serves the console on every interface, so it stays usable over Ethernet or an existing Wi-Fi connection.
+
+#### Internet over a USB Wi-Fi adapter
+
+Plug in a USB Wi-Fi adapter and the script uses it for the internet while the onboard radio keeps hosting the hotspot and the web pages. On start it reads `/sys/class/net` to tell the USB radio from the onboard one, joins a saved network on the USB adapter, and only then brings the hotspot up. If the USB adapter claimed `wlan0`, the hotspot moves to the onboard radio on its own and says so. Phones on the hotspot also reach the internet through the adapter, and the admin console shows `uplink wlan1` (or `uplink off`) beside the client count.
+
+The adapter only joins networks NetworkManager already knows. Save one for it once, from the Pi or the admin console:
+```bash
+sudo nmcli device wifi connect "<ssid>" password "<password>" ifname wlan1
+```
+Without an adapter, or when no saved network is in range, the script warns and runs the hotspot alone as before. Keep `ACCESS_POINT_ADDRESS` off the subnet of the network the adapter joins; the script warns if they overlap.
 
 ### Chat
 

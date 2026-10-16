@@ -5,6 +5,7 @@ function ConsoleStatus(props) {
     session.ssid,
     "ap " + (session.access_point_active ? "up" : "off"),
     "clients " + session.station_count,
+    "uplink " + (session.uplink_connected ? session.uplink_interface : "off"),
     "timeout " + session.command_timeout_seconds + "s",
   ];
 

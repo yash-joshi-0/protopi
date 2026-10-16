@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
+from contextlib import redirect_stdout
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -73,6 +75,9 @@ BROWSER_TIMEOUT_MS = 60000
 BROWSER_VIRTUAL_TIME_MS = 20000
 SHORT_COMMAND_TIMEOUT_MS = 1500
 ROOT_ELEMENT_MARKER = '<div id="root">'
+ONBOARD_WIRELESS = ("DEVTYPE=wlan\nINTERFACE=wlan0\n", "SDIO_ID=02D0:A9A6\n")
+USB_WIRELESS = ("DEVTYPE=wlan\nINTERFACE=wlan1\n", "DEVTYPE=usb_interface\n")
+USB_ETHERNET = ("INTERFACE=eth1\n", "DEVTYPE=usb_interface\n")
 JSX_COMPILE_SCRIPT = r"""
 const fs = require("fs");
 const Babel = require("./web/vendor/babel.min.js");
@@ -416,6 +421,176 @@ def check_access_point_fallback(recorder: CheckRecorder) -> None:
     recorder.check("shutdown is safe when never started", controller.active is False)
 
 
+# Contract: Write a fake /sys/class/net tree of interface and parent device uevents.
+def write_interface_root(root: Path, interfaces: Dict[str, Tuple[str, str]]) -> None:
+    for name, (interface_uevent, device_uevent) in interfaces.items():
+        device_path = root / name / "device"
+        device_path.mkdir(parents=True)
+        (root / name / "uevent").write_text(interface_uevent, encoding="utf-8")
+        (device_path / "uevent").write_text(device_uevent, encoding="utf-8")
+
+
+# Contract: Build a controller over a fake interface tree, returning it and its output.
+def build_detected_controller(interfaces: Dict[str, Tuple[str, str]]):
+    output = io.StringIO()
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        write_interface_root(root, interfaces)
+
+        with redirect_stdout(output):
+            controller = access_point.AccessPointController(network_interface_root=root)
+
+    return controller, output.getvalue()
+
+
+# Contract: Check the onboard radio hosts and a USB radio is picked as the uplink.
+def check_wireless_detection(recorder: CheckRecorder) -> None:
+    controller, _ = build_detected_controller(
+        {"wlan0": ONBOARD_WIRELESS, "wlan1": USB_WIRELESS, "eth1": USB_ETHERNET}
+    )
+    recorder.check(
+        "onboard radio keeps the hotspot",
+        controller.interface == "wlan0",
+        controller.interface,
+    )
+    recorder.check(
+        "usb radio becomes the uplink",
+        controller.uplink_interface == "wlan1",
+        f"{controller.uplink_interface}",
+    )
+
+    controller, output = build_detected_controller(
+        {"wlan0": USB_WIRELESS, "wlan1": ONBOARD_WIRELESS}
+    )
+    recorder.check(
+        "usb radio on wlan0 moves the hotspot onboard",
+        controller.interface == "wlan1",
+        controller.interface,
+    )
+    recorder.check(
+        "usb radio on wlan0 becomes the uplink",
+        controller.uplink_interface == "wlan0",
+        f"{controller.uplink_interface}",
+    )
+    recorder.check("the hotspot move is reported", "Warning:" in output)
+
+    controller, _ = build_detected_controller({"wlan0": ONBOARD_WIRELESS})
+    recorder.check("no usb radio means no uplink", controller.uplink_interface is None)
+
+    controller, _ = build_detected_controller({"wlan0": USB_WIRELESS})
+    recorder.check(
+        "a lone usb radio keeps the hotspot", controller.interface == "wlan0"
+    )
+    recorder.check(
+        "a lone usb radio is not also the uplink", controller.uplink_interface is None
+    )
+
+    controller = access_point.AccessPointController(
+        network_interface_root=Path(tempfile.gettempdir()) / "protopi-missing-sysfs"
+    )
+    recorder.check(
+        "missing sysfs keeps the configured interface",
+        controller.interface == access_point.ACCESS_POINT_INTERFACE,
+    )
+    recorder.check("missing sysfs means no uplink", controller.uplink_interface is None)
+
+
+# Contract: Check the uplink joins before the hotspot and failures do not stop it.
+def check_uplink_sequence(recorder: CheckRecorder) -> None:
+    controller, _ = build_detected_controller(
+        {"wlan0": ONBOARD_WIRELESS, "wlan1": USB_WIRELESS}
+    )
+    controller.nmcli_path = "nmcli"
+    calls: List[List[str]] = []
+    timeouts: List[int] = []
+    responses = {
+        "IP4.ADDRESS": "192.168.4.20/24 | 10.0.0.5/8\n",
+        "GENERAL.STATE": "100 (connected)\n",
+    }
+    failing_arguments: List[str] = []
+
+    def record(arguments, timeout_ms=access_point.NMCLI_TIMEOUT_MS):
+        calls.append(arguments)
+        timeouts.append(timeout_ms)
+        stdout = next(
+            (value for key, value in responses.items() if key in arguments), ""
+        )
+
+        if failing_arguments and failing_arguments[0] in arguments:
+            return subprocess.CompletedProcess(arguments, 10, "", "No network.")
+
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    controller.run_nmcli = record
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        started = controller.start()
+
+    joined = [" ".join(call) for call in calls]
+    connect_index = next(
+        (index for index, call in enumerate(joined) if "device connect wlan1" in call),
+        None,
+    )
+    up_index = next(
+        (index for index, call in enumerate(joined) if "connection up" in call), None
+    )
+    recorder.check("uplink connects on the usb radio", connect_index is not None)
+
+    if connect_index is None or up_index is None:
+        return
+
+    wait_seconds = access_point.UPLINK_CONNECT_TIMEOUT_MS // 1000
+    recorder.check(
+        "uplink connects before the hotspot comes up", connect_index < up_index
+    )
+    recorder.check(
+        "uplink tells nmcli how long to wait",
+        f"--wait {wait_seconds}" in joined[connect_index],
+    )
+    recorder.check(
+        "uplink kill timeout outlasts the nmcli wait",
+        timeouts[connect_index] > access_point.UPLINK_CONNECT_TIMEOUT_MS,
+    )
+    recorder.check(
+        "hotspot still binds the onboard radio",
+        any("ifname wlan0" in call for call in joined),
+    )
+    recorder.check("hotspot comes up alongside the uplink", started is True)
+    recorder.check(
+        "overlapping uplink subnet is reported", "overlaps" in output.getvalue()
+    )
+    recorder.check(
+        "uplink state reads as connected", controller.uplink_connected() is True
+    )
+
+    responses["GENERAL.STATE"] = "30 (disconnected)\n"
+    recorder.check(
+        "uplink state reads as disconnected", controller.uplink_connected() is False
+    )
+
+    responses["IP4.ADDRESS"] = "10.0.0.5/8\n"
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        controller.report_subnet_overlap()
+
+    recorder.check("separate uplink subnet is quiet", output.getvalue() == "")
+
+    failing_arguments.append("connect")
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        started = controller.start()
+
+    recorder.check("failed uplink still raises the hotspot", started is True)
+    recorder.check(
+        "failed uplink says how to save a network",
+        "nmcli device wifi connect" in output.getvalue(),
+    )
+
+
 # Contract: Check the static file routes serve the page and refuse escapes.
 def check_static_serving(recorder: CheckRecorder) -> None:
     server, client = start_console()
@@ -531,6 +706,10 @@ def check_session_api(recorder: CheckRecorder) -> None:
         recorder.check(
             "login reports the console state",
             "working_directory" in payload and "command_timeout_seconds" in payload,
+        )
+        recorder.check(
+            "login reports the uplink state",
+            "uplink_interface" in payload and payload.get("uplink_connected") is False,
         )
 
         status, payload, _ = client.json_request("/api/session")
@@ -983,6 +1162,8 @@ def main() -> int:
     check_settings_validation(recorder)
     check_profile_arguments(recorder)
     check_access_point_fallback(recorder)
+    check_wireless_detection(recorder)
+    check_uplink_sequence(recorder)
     check_static_serving(recorder)
     check_session_api(recorder)
     check_command_guards(recorder)

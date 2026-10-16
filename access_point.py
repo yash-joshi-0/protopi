@@ -3,6 +3,7 @@ ADMIN_USERNAME = "protogen"
 ADMIN_PASSWORD = "change-me-before-use"
 
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -33,6 +34,7 @@ CONSOLE_PORT = 8080
 SESSION_IDLE_TIMEOUT_MS = 900000
 COMMAND_TIMEOUT_MS = 20000
 NMCLI_TIMEOUT_MS = 30000
+UPLINK_CONNECT_TIMEOUT_MS = 20000
 REQUEST_TIMEOUT_MS = 15000
 LOGIN_ATTEMPT_LIMIT = 5
 LOGIN_LOCKOUT_MS = 60000
@@ -85,6 +87,10 @@ PROTECTED_MANAGEMENT_FRAMES_DISABLED = "1"
 UNSET_REGULATORY_DOMAIN = "country 00:"
 TWO_GHZ_CHANNELS = range(1, 15)
 FIVE_GHZ_CHANNELS = range(32, 178)
+NETWORK_INTERFACE_ROOT = Path("/sys/class/net")
+WIRELESS_DEVICE_TYPE = "wlan"
+USB_DEVICE_TYPE = "usb_interface"
+CONNECTED_DEVICE_STATE = "100"
 
 
 # Class: SettingsError marks a configuration value the program cannot start with.
@@ -220,23 +226,83 @@ class AccessPointController:
         channel: int = ACCESS_POINT_CHANNEL,
         address: str = ACCESS_POINT_ADDRESS,
         prefix: int = ACCESS_POINT_PREFIX,
+        network_interface_root: Path = NETWORK_INTERFACE_ROOT,
     ) -> None:
         self.ssid = ssid
         self.passphrase = passphrase
-        self.interface = interface
         self.channel = channel
         self.address = address
         self.prefix = prefix
+        self.network_interface_root = network_interface_root
         self.nmcli_path = shutil.which("nmcli")
         self.active = False
+        onboard_interfaces, usb_interfaces = self.find_wireless_interfaces()
+        self.interface = self.choose_access_point_interface(
+            interface, onboard_interfaces, usb_interfaces
+        )
+        self.uplink_interface = next(
+            (name for name in usb_interfaces if name != self.interface), None
+        )
 
     # Contract: Return the wireless band that follows from the configured channel.
     @property
     def band(self) -> str:
         return "bg" if self.channel in TWO_GHZ_CHANNELS else "a"
 
+    # Contract: Return the KEY=value pairs of a sysfs uevent file, or {} if unreadable.
+    def read_uevent(self, uevent_path: Path) -> Dict[str, str]:
+        try:
+            lines = uevent_path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return {}
+        except OSError as error:
+            print(f"Warning: could not read {uevent_path} ({error}).")
+            return {}
+
+        pairs = [line.split("=", 1) for line in lines if "=" in line]
+        return {key: value for key, value in pairs}
+
+    # Contract: Return the onboard and the USB wireless interface names, each sorted.
+    def find_wireless_interfaces(self) -> tuple[List[str], List[str]]:
+        onboard_interfaces: List[str] = []
+        usb_interfaces: List[str] = []
+
+        if not self.network_interface_root.is_dir():
+            return onboard_interfaces, usb_interfaces
+
+        for interface_path in sorted(self.network_interface_root.iterdir()):
+            interface_uevent = self.read_uevent(interface_path / "uevent")
+
+            if interface_uevent.get("DEVTYPE") != WIRELESS_DEVICE_TYPE:
+                continue
+
+            device_uevent = self.read_uevent(interface_path / "device" / "uevent")
+
+            if device_uevent.get("DEVTYPE") == USB_DEVICE_TYPE:
+                usb_interfaces.append(interface_path.name)
+            else:
+                onboard_interfaces.append(interface_path.name)
+
+        return onboard_interfaces, usb_interfaces
+
+    # Contract: Host on the configured interface unless it is USB and onboard exists.
+    def choose_access_point_interface(
+        self, interface: str, onboard_interfaces: List[str], usb_interfaces: List[str]
+    ) -> str:
+        if interface in usb_interfaces and onboard_interfaces:
+            onboard_interface = onboard_interfaces[0]
+            print(
+                f"Warning: {interface} is a USB adapter; "
+                f"hosting on the onboard {onboard_interface} instead."
+            )
+            return onboard_interface
+
+        return interface
+
     # Contract: Run one nmcli invocation and return it, or None when nmcli is missing.
-    def run_nmcli(self, arguments: List[str]) -> subprocess.CompletedProcess | None:
+    def run_nmcli(
+        self, arguments: List[str], timeout_ms: int = NMCLI_TIMEOUT_MS
+    ) -> subprocess.CompletedProcess | None:
         if self.nmcli_path is None:
             return None
 
@@ -244,8 +310,89 @@ class AccessPointController:
             [self.nmcli_path, *arguments],
             capture_output=True,
             text=True,
-            timeout=NMCLI_TIMEOUT_MS / 1000,
+            timeout=timeout_ms / 1000,
         )
+
+    # Contract: Join a saved network on the USB adapter so it carries the internet.
+    def connect_uplink(self) -> bool:
+        if self.uplink_interface is None:
+            return False
+
+        try:
+            connected = self.run_nmcli(
+                [
+                    "--wait",
+                    str(UPLINK_CONNECT_TIMEOUT_MS // 1000),
+                    "device",
+                    "connect",
+                    self.uplink_interface,
+                ],
+                UPLINK_CONNECT_TIMEOUT_MS + NMCLI_TIMEOUT_MS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Warning: no internet uplink on {self.uplink_interface} ({error}).")
+            return False
+
+        if connected is None or connected.returncode != 0:
+            detail = connected.stderr.strip() if connected else "nmcli missing"
+            print(f"Warning: no internet uplink on {self.uplink_interface} ({detail}).")
+            print(
+                "Warning: save a network for it with "
+                f"'nmcli device wifi connect <ssid> ifname {self.uplink_interface}'."
+            )
+            return False
+
+        print(f"Internet uplink is up on {self.uplink_interface}.")
+        self.report_subnet_overlap()
+        return True
+
+    # Contract: Warn when the uplink network collides with the hotspot's own subnet.
+    def report_subnet_overlap(self) -> None:
+        try:
+            shown = self.run_nmcli(
+                ["-g", "IP4.ADDRESS", "device", "show", self.uplink_interface]
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Warning: could not read the uplink address ({error}).")
+            return
+
+        if shown is None or shown.returncode != 0:
+            return
+
+        hotspot_network = ipaddress.ip_network(
+            f"{self.address}/{self.prefix}", strict=False
+        )
+
+        for entry in shown.stdout.replace("|", " ").split():
+            try:
+                uplink_network = ipaddress.ip_interface(entry).network
+            except ValueError:
+                print(f"Warning: unreadable uplink address '{entry}'.")
+                continue
+
+            if uplink_network.overlaps(hotspot_network):
+                print(
+                    f"Warning: the uplink network {uplink_network} overlaps the "
+                    f"hotspot's {hotspot_network}; change ACCESS_POINT_ADDRESS."
+                )
+
+    # Contract: Return whether the USB uplink is currently connected to a network.
+    def uplink_connected(self) -> bool:
+        if self.uplink_interface is None:
+            return False
+
+        try:
+            shown = self.run_nmcli(
+                ["-g", "GENERAL.STATE", "device", "show", self.uplink_interface]
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Warning: could not read the uplink state ({error}).")
+            return False
+
+        if shown is None or shown.returncode != 0:
+            return False
+
+        return shown.stdout.strip().startswith(CONNECTED_DEVICE_STATE)
 
     # Contract: Report why the hotspot cannot come up and leave the console running.
     def report_unavailable(self, reason: str) -> None:
@@ -351,6 +498,7 @@ class AccessPointController:
             print("Warning: not running as root; nmcli may refuse to build the AP.")
 
         self.report_radio_warnings()
+        self.connect_uplink()
 
         try:
             self.remove_existing_profile()
@@ -514,6 +662,8 @@ class AdminConsoleServer(ThreadingHTTPServer):
             "working_directory": session.working_directory,
             "access_point_active": self.access_point.active,
             "station_count": len(self.access_point.connected_stations()),
+            "uplink_interface": self.access_point.uplink_interface,
+            "uplink_connected": self.access_point.uplink_connected(),
             "command_timeout_seconds": COMMAND_TIMEOUT_MS // 1000,
         }
 
