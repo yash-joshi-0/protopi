@@ -9,16 +9,19 @@ import os
 import secrets
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterator, List
 from urllib.parse import urlparse
 
 # User Values: These may need to be changed to match the Pi and the wireless setup.
@@ -91,10 +94,18 @@ NETWORK_INTERFACE_ROOT = Path("/sys/class/net")
 WIRELESS_DEVICE_TYPE = "wlan"
 USB_DEVICE_TYPE = "usb_interface"
 CONNECTED_DEVICE_STATE = "100"
+DISCONNECTED_CONNECTION_NAMES = ("", "--")
+STOP_SIGNAL_NAMES = ("SIGHUP", "SIGTERM")
+HANGUP_SIGNAL_NAME = "SIGHUP"
 
 
 # Class: SettingsError marks a configuration value the program cannot start with.
 class SettingsError(Exception):
+    pass
+
+
+# Class: StopRequested carries a hangup or terminate signal out to main's cleanup.
+class StopRequested(Exception):
     pass
 
 
@@ -488,6 +499,40 @@ class AccessPointController:
             print("Warning: no WLAN country is set, which blocks AP mode on the Pi.")
             print("Warning: set one with 'raspi-config' under Localisation Options.")
 
+    # Contract: Return the connection the hotspot interface carries now, or None.
+    def current_connection(self) -> str | None:
+        try:
+            shown = self.run_nmcli(
+                ["-g", "GENERAL.CONNECTION", "device", "show", self.interface]
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Warning: could not read the state of {self.interface} ({error}).")
+            return None
+
+        if shown is None or shown.returncode != 0:
+            return None
+
+        connection_name = shown.stdout.strip()
+
+        if connection_name in DISCONNECTED_CONNECTION_NAMES:
+            return None
+
+        return connection_name
+
+    # Contract: Warn that taking over a connected interface cuts what runs over it.
+    def report_connection_takeover(self) -> None:
+        connection_name = self.current_connection()
+
+        if connection_name is None or connection_name == CONNECTION_NAME:
+            return
+
+        print(
+            f"Warning: {self.interface} is connected to '{connection_name}', "
+            "and the hotspot will take it over."
+        )
+        print("Warning: an SSH session over it will drop and stop the hotspot too.")
+        print("Warning: start with nohup, or from a local console, to keep it up.")
+
     # Contract: Bring the hotspot up and report whether it is now serving clients.
     def start(self) -> bool:
         if self.nmcli_path is None:
@@ -498,6 +543,7 @@ class AccessPointController:
             print("Warning: not running as root; nmcli may refuse to build the AP.")
 
         self.report_radio_warnings()
+        self.report_connection_takeover()
         self.connect_uplink()
 
         try:
@@ -1064,6 +1110,51 @@ def cache_control_for(target: Path) -> str:
     return NO_STORE_CACHE_CONTROL
 
 
+# Contract: Mute output once the terminal hangs up, then unwind main to clean up.
+def handle_stop_signal(signal_number: int, frame) -> None:
+    signal_name = signal.Signals(signal_number).name
+
+    if signal_name == HANGUP_SIGNAL_NAME and sys.stdout.isatty():
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = sys.stdout
+
+    raise StopRequested(signal_name)
+
+
+# Contract: Route stop signals to a clean shutdown, leaving any nohup ignore in place.
+def install_stop_handlers() -> List[int]:
+    installed: List[int] = []
+
+    for signal_name in STOP_SIGNAL_NAMES:
+        signal_number = getattr(signal, signal_name, None)
+
+        if signal_number is None:
+            continue
+
+        if signal.getsignal(signal_number) == signal.SIG_IGN:
+            continue
+
+        signal.signal(signal_number, handle_stop_signal)
+        installed.append(signal_number)
+
+    return installed
+
+
+# Contract: Hold the given signals for the block, delivering them when it ends.
+@contextmanager
+def deferred_signals(signal_numbers: List[int]) -> Iterator[None]:
+    if not signal_numbers or not hasattr(signal, "pthread_sigmask"):
+        yield
+        return
+
+    signal.pthread_sigmask(signal.SIG_BLOCK, signal_numbers)
+
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, signal_numbers)
+
+
 # Contract: Start the hotspot, serve the admin console, and clean both up on exit.
 def main() -> None:
     try:
@@ -1079,25 +1170,34 @@ def main() -> None:
         return
 
     access_point = AccessPointController()
-    access_point.start()
-
-    bind_address = ACCESS_POINT_ADDRESS if access_point.active else "0.0.0.0"
-    server = AdminConsoleServer(
-        (bind_address, CONSOLE_PORT), ConsoleRequestHandler, access_point, chat_store
-    )
-
-    print(f"Chat on http://{bind_address}:{CONSOLE_PORT}/")
-    print(f"Admin console on http://{bind_address}:{CONSOLE_PORT}/admin")
-    print(f"Sign in as '{ADMIN_USERNAME}'. Press Ctrl+C to stop.")
+    stop_signals = install_stop_handlers()
+    server = None
 
     try:
+        with deferred_signals(stop_signals):
+            access_point.start()
+
+        bind_address = ACCESS_POINT_ADDRESS if access_point.active else "0.0.0.0"
+        server = AdminConsoleServer(
+            (bind_address, CONSOLE_PORT),
+            ConsoleRequestHandler,
+            access_point,
+            chat_store,
+        )
+
+        print(f"Chat on http://{bind_address}:{CONSOLE_PORT}/")
+        print(f"Admin console on http://{bind_address}:{CONSOLE_PORT}/admin")
+        print(f"Sign in as '{ADMIN_USERNAME}'. Press Ctrl+C to stop.")
         server.serve_forever()
     except KeyboardInterrupt:
         print()
         print("Exiting...")
+    except StopRequested as stop:
+        print(f"Exiting on {stop}...")
     finally:
-        server.shutdown()
-        server.server_close()
+        if server is not None:
+            server.server_close()
+
         access_point.shutdown()
 
 

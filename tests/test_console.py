@@ -6,7 +6,9 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -536,10 +538,23 @@ def check_uplink_sequence(recorder: CheckRecorder) -> None:
     up_index = next(
         (index for index, call in enumerate(joined) if "connection up" in call), None
     )
+    takeover_index = next(
+        (
+            index
+            for index, call in enumerate(joined)
+            if "GENERAL.CONNECTION device show wlan0" in call
+        ),
+        None,
+    )
     recorder.check("uplink connects on the usb radio", connect_index is not None)
 
     if connect_index is None or up_index is None:
         return
+
+    recorder.check(
+        "takeover is checked before the uplink moves anything",
+        takeover_index is not None and takeover_index < connect_index,
+    )
 
     wait_seconds = access_point.UPLINK_CONNECT_TIMEOUT_MS // 1000
     recorder.check(
@@ -589,6 +604,97 @@ def check_uplink_sequence(recorder: CheckRecorder) -> None:
         "failed uplink says how to save a network",
         "nmcli device wifi connect" in output.getvalue(),
     )
+
+
+# Contract: Check a connected hotspot interface is warned about and an idle one is not.
+def check_connection_takeover(recorder: CheckRecorder) -> None:
+    controller = access_point.AccessPointController()
+    controller.nmcli_path = "nmcli"
+    reply = {"stdout": "", "returncode": 0}
+
+    def record(arguments, timeout_ms=access_point.NMCLI_TIMEOUT_MS):
+        return subprocess.CompletedProcess(
+            arguments, reply["returncode"], reply["stdout"], ""
+        )
+
+    controller.run_nmcli = record
+
+    def takeover_output(stdout: str, returncode: int = 0) -> str:
+        reply["stdout"] = stdout
+        reply["returncode"] = returncode
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            controller.report_connection_takeover()
+
+        return output.getvalue()
+
+    warned = takeover_output("2399\n")
+    recorder.check("a connected interface is warned about", "Warning:" in warned)
+    recorder.check("the warning names the connection", "'2399'" in warned)
+    recorder.check("the warning mentions SSH", "SSH" in warned)
+    recorder.check("an idle interface is quiet", takeover_output("\n") == "")
+    recorder.check("a dashed interface is quiet", takeover_output("--\n") == "")
+    recorder.check(
+        "our own hotspot is not a takeover",
+        takeover_output(f"{access_point.CONNECTION_NAME}\n") == "",
+    )
+    recorder.check("an nmcli failure is quiet", takeover_output("x\n", 10) == "")
+
+
+# Contract: Check stop signals unwind to cleanup, respect nohup, and wait out startup.
+def check_stop_signals(recorder: CheckRecorder) -> None:
+    try:
+        access_point.handle_stop_signal(signal.SIGTERM, None)
+        raised = None
+    except access_point.StopRequested as stop:
+        raised = str(stop)
+
+    recorder.check("a stop signal raises StopRequested", raised == "SIGTERM", raised)
+
+    stop_numbers = [
+        getattr(signal, name)
+        for name in access_point.STOP_SIGNAL_NAMES
+        if hasattr(signal, name)
+    ]
+    originals = {number: signal.getsignal(number) for number in stop_numbers}
+
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        installed = access_point.install_stop_handlers()
+        recorder.check(
+            "an ignored signal is left alone, as nohup needs",
+            signal.SIGTERM not in installed
+            and signal.getsignal(signal.SIGTERM) == signal.SIG_IGN,
+        )
+
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        installed = access_point.install_stop_handlers()
+        recorder.check(
+            "a default signal gets the stop handler",
+            signal.SIGTERM in installed
+            and signal.getsignal(signal.SIGTERM) == access_point.handle_stop_signal,
+        )
+
+        if not hasattr(signal, "pthread_sigmask"):
+            recorder.skip("stop signals wait out startup", "no pthread_sigmask here")
+            return
+
+        reached_end_of_block = False
+        delivered = False
+
+        try:
+            with access_point.deferred_signals([signal.SIGTERM]):
+                os.kill(os.getpid(), signal.SIGTERM)
+                reached_end_of_block = True
+        except access_point.StopRequested:
+            delivered = True
+
+        recorder.check("a deferred signal does not cut startup", reached_end_of_block)
+        recorder.check("a deferred signal arrives after startup", delivered)
+    finally:
+        for number, handler in originals.items():
+            signal.signal(number, handler)
 
 
 # Contract: Check the static file routes serve the page and refuse escapes.
@@ -1164,6 +1270,8 @@ def main() -> int:
     check_access_point_fallback(recorder)
     check_wireless_detection(recorder)
     check_uplink_sequence(recorder)
+    check_connection_takeover(recorder)
+    check_stop_signals(recorder)
     check_static_serving(recorder)
     check_session_api(recorder)
     check_command_guards(recorder)
