@@ -709,6 +709,40 @@ def check_frames_file(recorder: CheckRecorder) -> None:
     )
 
 
+# Contract: Check that brightness maps onto luma's 0-255 scale and out-of-range clamps.
+def check_matrix_brightness(recorder: CheckRecorder) -> None:
+    module = FakeHardware().load_target()
+    recorder.check("default brightness is 0", module.MATRIX_BRIGHTNESS == 0)
+
+    controller = build_controller(module, use_status_screen=False)
+    recorder.check(
+        "default keeps the lowest hardware step",
+        controller.device.contrast_value >> 4 == 0,
+        str(controller.device.contrast_value),
+    )
+
+    for brightness in (0, 7, 15):
+        controller.set_matrix_brightness(brightness)
+        recorder.check(
+            f"brightness {brightness} reaches the chip as step {brightness}",
+            controller.device.contrast_value >> 4 == brightness
+            and 0 <= controller.device.contrast_value <= 255,
+            str(controller.device.contrast_value),
+        )
+
+    for requested, expected in ((-3, 0), (16, 15), (255, 15)):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            controller.set_matrix_brightness(requested)
+        recorder.check(
+            f"brightness {requested} clamps to {expected} with a warning",
+            controller.matrix_brightness == expected
+            and controller.device.contrast_value >> 4 == expected
+            and buffer.getvalue().startswith("Warning:"),
+            buffer.getvalue().strip(),
+        )
+
+
 # Contract: Run every check group and return the exit code for the process.
 def main() -> int:
     recorder = CheckRecorder()
@@ -724,6 +758,7 @@ def main() -> int:
     check_shutdown(recorder)
     check_face_rendering(recorder)
     check_frames_file(recorder)
+    check_matrix_brightness(recorder)
     return recorder.summary()
 
 

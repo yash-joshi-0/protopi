@@ -39,10 +39,9 @@ MOUTH_RIGHT_START = 10
 # Configuration values: These can be changed to personal preference.
 BUTTON_PIN = 27
 BUTTON_DEBOUNCE_MS = 50
-BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
+BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1 # Set this to GPIO.LOW if the button circuit is wired as active-low.
 FRAMES_FILE = "frames.json"
-
-# Set this to GPIO.LOW if the button circuit is wired as active-low.
+MATRIX_BRIGHTNESS = 0
 
 STATUS_SCREEN_SPI_PORT = 1
 STATUS_SCREEN_SPI_DEVICE = 0
@@ -54,6 +53,7 @@ STATUS_SCREEN_BUS_SPEED_HZ = 4000000
 
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
+MATRIX_BRIGHTNESS_MAX = 15
 FRAME_SIZE = 8
 FRAME_COUNTS = {"eye_open": 2, "eye_blink": 2, "nose": 1, "mouth": 4}
 WIDTH = NUM_MATRICES * 8
@@ -147,6 +147,7 @@ class Max7219FaceController:
         button_debounce_ms: int = BUTTON_DEBOUNCE_MS,
         use_status_screen: bool = True,
         frames_path: Path | None = None,
+        matrix_brightness: int = MATRIX_BRIGHTNESS,
     ) -> None:
         self.num_matrices = num_matrices
         self.config_path = config_path or Path(__file__).resolve().with_name(
@@ -167,7 +168,7 @@ class Max7219FaceController:
             cascaded=self.num_matrices,
             block_orientation=0,
         )
-        self.device.contrast(1)
+        self.set_matrix_brightness(matrix_brightness)
 
         self.status_device = None
         self.status_font = None
@@ -215,6 +216,19 @@ class Max7219FaceController:
         if GPIO is not None:
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=BUTTON_PULL)
             self._gpio_configured = True
+
+    # Contract: Clamp brightness to the MAX7219's 0-15 steps and apply it to the chain.
+    def set_matrix_brightness(self, brightness: int) -> None:
+        if not 0 <= brightness <= MATRIX_BRIGHTNESS_MAX:
+            clamped = min(max(brightness, 0), MATRIX_BRIGHTNESS_MAX)
+            print(
+                f"Warning: matrix brightness {brightness} is outside "
+                f"0-{MATRIX_BRIGHTNESS_MAX}, using {clamped}."
+            )
+            brightness = clamped
+
+        self.matrix_brightness = brightness
+        self.device.contrast(brightness << 4)
 
     # Contract: Initialize the OLED status screen on the configured SPI chip select.
     def _initialize_status_screen(self) -> bool:

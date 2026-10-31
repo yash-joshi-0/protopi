@@ -201,6 +201,8 @@ Without `--screen` the program never opens SPI1. With the flag it still falls ba
 
 5. Edit the face in `frames.json`. Each frame is one 8×8 panel written as 8 rows of `0` (off) and `1` (on), grouped top to bottom of the face: `eye_open` (2 frames), `eye_blink` (2), `nose` (1), and `mouth` (4). The right side of the face mirrors the left. To use a different file, change `FRAMES_FILE` under `# Configuration values:` in `max7219.py`; a relative name is looked up next to the script. A malformed frame or row prints a `Warning:` naming the entry and is left blank, and the rest of the face still draws.
 
+6. Set the face brightness with `MATRIX_BRIGHTNESS` under `# Configuration values:` in `max7219.py`, from `0` (dimmest, the default) to `15` (brightest). Even `0` stays faintly lit, because the MAX7219 has no "off" step. Values outside 0–15 print a `Warning:` and are clamped.
+
 ### Wireless access point and admin console
 
 `access_point.py` turns the Pi's Wi-Fi into a hotspot and serves a chat at `/` and a password-protected admin console at `/admin` for running shell commands on the suit from a phone without a keyboard or an SSH client.
