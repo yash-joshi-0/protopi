@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -35,11 +36,14 @@ NOSE_RIGHT = 7
 EYE_RIGHT_START = 8
 MOUTH_RIGHT_START = 10
 
-# Configuration values: These can be changes to personal preference.
+# Configuration values: These can be changed to personal preference.
 BUTTON_PIN = 27
 BUTTON_DEBOUNCE_MS = 50
 BUTTON_ACTIVE_STATE = GPIO.HIGH if GPIO is not None else 1
+FRAMES_FILE = "frames.json"
+
 # Set this to GPIO.LOW if the button circuit is wired as active-low.
+
 STATUS_SCREEN_SPI_PORT = 1
 STATUS_SCREEN_SPI_DEVICE = 0
 STATUS_SCREEN_DC_PIN = 24
@@ -48,9 +52,10 @@ STATUS_SCREEN_REFRESH_MS = 0
 STATUS_SCREEN_PROBE_INTERVAL_MS = 1000
 STATUS_SCREEN_BUS_SPEED_HZ = 4000000
 
-
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
+FRAME_SIZE = 8
+FRAME_COUNTS = {"eye_open": 2, "eye_blink": 2, "nose": 1, "mouth": 4}
 WIDTH = NUM_MATRICES * 8
 HEIGHT = 8
 STATUS_SCREEN_WIDTH = 128
@@ -108,6 +113,30 @@ class MatrixConfig:
             self.transform_map.append(row)
 
 
+# Class: FaceFrames holds the row bitmaps for each face feature, in FRAME_COUNTS order.
+@dataclass
+class FaceFrames:
+    eye_open: List[List[int]]
+    eye_blink: List[List[int]]
+    nose: List[List[int]]
+    mouth: List[List[int]]
+
+
+# Contract: Return an all-off frame.
+def blank_frame() -> List[int]:
+    return [0] * FRAME_SIZE
+
+
+# Contract: Return a FaceFrames with every feature blank.
+def blank_face_frames() -> FaceFrames:
+    return FaceFrames(
+        **{
+            feature_name: [blank_frame() for _ in range(frame_count)]
+            for feature_name, frame_count in FRAME_COUNTS.items()
+        }
+    )
+
+
 # Class: Max7219FaceController for the framebuffer, animation loop, and calibration flow.
 class Max7219FaceController:
     # Contract: Initialize the controller, hardware device, and default state values.
@@ -117,11 +146,13 @@ class Max7219FaceController:
         config_path: Path | None = None,
         button_debounce_ms: int = BUTTON_DEBOUNCE_MS,
         use_status_screen: bool = True,
+        frames_path: Path | None = None,
     ) -> None:
         self.num_matrices = num_matrices
         self.config_path = config_path or Path(__file__).resolve().with_name(
             CONFIG_FILE
         )
+        self.frames_path = frames_path or Path(__file__).resolve().parent / FRAMES_FILE
         self.width = num_matrices * 8
         self.height = 8
         self.use_status_screen = use_status_screen
@@ -160,6 +191,7 @@ class Max7219FaceController:
         self.matrix_configs: List[MatrixConfig] = []
         self.framebuffer = [[0] * self.width for _ in range(self.height)]
         self.load_matrix_config()
+        self.frames = self.load_frames()
 
         self.calibration_mode = False
         self.show_markers = True
@@ -382,6 +414,106 @@ class Max7219FaceController:
                     f"{int(matrix_config.flip_y)}\n"
                 )
 
+    # Contract: Load the face bitmaps from the frames file, blanking unusable entries.
+    def load_frames(self) -> FaceFrames:
+        try:
+            with self.frames_path.open("r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except OSError as error:
+            print(
+                f"Warning: could not read {self.frames_path} ({error}), "
+                f"the face will be blank."
+            )
+            return blank_face_frames()
+        except json.JSONDecodeError as error:
+            print(
+                f"Warning: {self.frames_path.name} line {error.lineno}: "
+                f"{error.msg}, the face will be blank."
+            )
+            return blank_face_frames()
+
+        if not isinstance(document, dict):
+            print(
+                f"Warning: {self.frames_path.name}: expected an object of named "
+                f"frame lists, the face will be blank."
+            )
+            return blank_face_frames()
+
+        for unknown_name in sorted(set(document) - set(FRAME_COUNTS)):
+            print(
+                f"Warning: {self.frames_path.name}: unknown entry {unknown_name!r}, "
+                f"expected one of {', '.join(FRAME_COUNTS)}."
+            )
+
+        return FaceFrames(
+            **{
+                feature_name: self.parse_feature_frames(
+                    feature_name, document.get(feature_name), frame_count
+                )
+                for feature_name, frame_count in FRAME_COUNTS.items()
+            }
+        )
+
+    # Contract: Parse one feature's frame list, padding or trimming to frame_count.
+    def parse_feature_frames(
+        self, feature_name: str, entry: object, frame_count: int
+    ) -> List[List[int]]:
+        location = f"{self.frames_path.name} {feature_name}"
+
+        if not isinstance(entry, list):
+            problem = "missing" if entry is None else "expected a list of frames"
+            print(f"Warning: {location}: {problem}, using blank frames.")
+            return [blank_frame() for _ in range(frame_count)]
+
+        if len(entry) < frame_count:
+            print(
+                f"Warning: {location}: expected {frame_count} frames but found "
+                f"{len(entry)}, blanking the missing ones."
+            )
+        elif len(entry) > frame_count:
+            print(
+                f"Warning: {location}: expected {frame_count} frames but found "
+                f"{len(entry)}, ignoring the rest."
+            )
+
+        frames: List[List[int]] = []
+
+        for frame_index in range(frame_count):
+            if frame_index < len(entry):
+                frame_location = f"{location} frame {frame_index + 1}"
+                frames.append(self.parse_frame(entry[frame_index], frame_location))
+            else:
+                frames.append(blank_frame())
+
+        return frames
+
+    # Contract: Parse one frame of 0/1 row strings into row bitmaps, blanking bad rows.
+    def parse_frame(self, frame: object, location: str) -> List[int]:
+        if not isinstance(frame, list) or len(frame) != FRAME_SIZE:
+            print(
+                f"Warning: {location}: expected a list of {FRAME_SIZE} rows, "
+                f"using a blank frame."
+            )
+            return blank_frame()
+
+        rows: List[int] = []
+
+        for row_index, row in enumerate(frame, start=1):
+            if (
+                not isinstance(row, str)
+                or len(row) != FRAME_SIZE
+                or set(row) - {"0", "1"}
+            ):
+                print(
+                    f"Warning: {location} row {row_index}: expected {FRAME_SIZE} "
+                    f"characters of 0 and 1 but found {row!r}, blanking the row."
+                )
+                rows.append(0)
+            else:
+                rows.append(int(row, 2))
+
+        return rows
+
     # Contract: Clear the framebuffer contents.
     def clear(self) -> None:
         for row in self.framebuffer:
@@ -435,21 +567,17 @@ class Max7219FaceController:
 
     # Contract: Render the eye frames for the current blink state.
     def draw_eyes(self, blink: bool = False) -> None:
-        if blink:
-            self.draw_module(EYE_LEFT_START + 0, BLINK_FRAME_1)
-            self.draw_module(EYE_LEFT_START + 1, BLINK_FRAME_2)
-            self.draw_module(EYE_RIGHT_START + 0, BLINK_FRAME_2)
-            self.draw_module(EYE_RIGHT_START + 1, BLINK_FRAME_1)
-        else:
-            self.draw_module(EYE_LEFT_START + 0, EYE_FRAME_1)
-            self.draw_module(EYE_LEFT_START + 1, EYE_FRAME_2)
-            self.draw_module(EYE_RIGHT_START + 0, EYE_FRAME_2)
-            self.draw_module(EYE_RIGHT_START + 1, EYE_FRAME_1)
+        eye_frames = self.frames.eye_blink if blink else self.frames.eye_open
+
+        self.draw_module(EYE_LEFT_START + 0, eye_frames[0])
+        self.draw_module(EYE_LEFT_START + 1, eye_frames[1])
+        self.draw_module(EYE_RIGHT_START + 0, eye_frames[1])
+        self.draw_module(EYE_RIGHT_START + 1, eye_frames[0])
 
     # Contract: Render the nose frame into the framebuffer.
     def draw_nose(self) -> None:
-        self.draw_module(NOSE_LEFT, NOSE_FRAME)
-        self.draw_module(NOSE_RIGHT, NOSE_FRAME)
+        self.draw_module(NOSE_LEFT, self.frames.nose[0])
+        self.draw_module(NOSE_RIGHT, self.frames.nose[0])
 
     # Contract: Clear the mouth area before drawing the next mouth frame.
     def clear_mouth_modules(self) -> None:
@@ -463,15 +591,17 @@ class Max7219FaceController:
     def draw_mouth(self, step: int = 0) -> None:
         self.clear_mouth_modules()
 
-        self.draw_module(MOUTH_LEFT_START + 0, MOUTH_FRAME_4)
-        self.draw_module(MOUTH_LEFT_START + 1, MOUTH_FRAME_3)
-        self.draw_module(MOUTH_LEFT_START + 2, MOUTH_FRAME_2)
-        self.draw_module(MOUTH_LEFT_START + 3, MOUTH_FRAME_1)
+        mouth_frames = self.frames.mouth
 
-        self.draw_module(MOUTH_RIGHT_START + 0, MOUTH_FRAME_1)
-        self.draw_module(MOUTH_RIGHT_START + 1, MOUTH_FRAME_2)
-        self.draw_module(MOUTH_RIGHT_START + 2, MOUTH_FRAME_3)
-        self.draw_module(MOUTH_RIGHT_START + 3, MOUTH_FRAME_4)
+        self.draw_module(MOUTH_LEFT_START + 0, mouth_frames[3])
+        self.draw_module(MOUTH_LEFT_START + 1, mouth_frames[2])
+        self.draw_module(MOUTH_LEFT_START + 2, mouth_frames[1])
+        self.draw_module(MOUTH_LEFT_START + 3, mouth_frames[0])
+
+        self.draw_module(MOUTH_RIGHT_START + 0, mouth_frames[0])
+        self.draw_module(MOUTH_RIGHT_START + 1, mouth_frames[1])
+        self.draw_module(MOUTH_RIGHT_START + 2, mouth_frames[2])
+        self.draw_module(MOUTH_RIGHT_START + 3, mouth_frames[3])
 
         if step > 0:
             self.clear_module(MOUTH_LEFT_START + 3)
@@ -705,106 +835,6 @@ def main() -> None:
         print("Exiting...")
     finally:
         controller.shutdown()
-
-
-BLINK_FRAME_1 = [
-    0b00000000,
-    0b11000000,
-    0b11111000,
-    0b11111100,
-    0b00001110,
-    0b00000110,
-    0b00000000,
-    0b00000000,
-]
-
-BLINK_FRAME_2 = [
-    0b00000000,
-    0b00000000,
-    0b00000111,
-    0b00111111,
-    0b11100000,
-    0b10000000,
-    0b00000000,
-    0b00000000,
-]
-
-MOUTH_FRAME_1 = [
-    0b00000100,
-    0b00011110,
-    0b01111000,
-    0b11100000,
-    0b10000000,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-]
-
-MOUTH_FRAME_2 = [
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000001,
-    0b00000111,
-    0b00011110,
-    0b01111000,
-    0b11100000,
-]
-
-MOUTH_FRAME_3 = [
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b11100000,
-    0b01111000,
-    0b00011110,
-    0b00000111,
-]
-
-MOUTH_FRAME_4 = [
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000111,
-    0b00011111,
-    0b01111000,
-    0b11100000,
-    0b10000000,
-]
-
-NOSE_FRAME = [
-    0b01111000,
-    0b11110000,
-    0b11000000,
-    0b11000000,
-    0b11000000,
-    0b11000000,
-    0b10000000,
-    0b00000000,
-]
-
-EYE_FRAME_1 = [
-    0b11110000,
-    0b11111100,
-    0b11111110,
-    0b11111111,
-    0b00001111,
-    0b00000110,
-    0b00000000,
-    0b00000000,
-]
-
-EYE_FRAME_2 = [
-    0b00000000,
-    0b00000111,
-    0b00011111,
-    0b01111111,
-    0b11100000,
-    0b10000000,
-    0b00000000,
-    0b00000000,
-]
 
 
 if __name__ == "__main__":

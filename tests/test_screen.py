@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import time
@@ -603,6 +604,111 @@ def check_face_rendering(recorder: CheckRecorder) -> None:
     recorder.check("blink differs from idle", blink_points != idle_points)
 
 
+# Contract: Check that frames come from frames.json and bad entries fall back to blank.
+def check_frames_file(recorder: CheckRecorder) -> None:
+    module = FakeHardware().load_target()
+    recorder.check(
+        "frames file defaults to frames.json", module.FRAMES_FILE == "frames.json"
+    )
+    recorder.check(
+        "no frame constants left in the script",
+        not hasattr(module, "EYE_FRAME_1") and not hasattr(module, "MOUTH_FRAME_1"),
+    )
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        controller = build_controller(module, use_status_screen=False)
+
+    recorder.check(
+        "shipped frames.json loads cleanly",
+        "Warning:" not in buffer.getvalue(),
+        buffer.getvalue().strip(),
+    )
+    recorder.check(
+        "frames sit next to the script",
+        controller.frames_path == REPO_ROOT / "frames.json",
+    )
+    recorder.check(
+        "eye_open frame 1 decoded from bit strings",
+        controller.frames.eye_open[0][:4] == [0b11110000, 0b11111100, 0b11111110, 0xFF],
+    )
+    recorder.check(
+        "frame counts match FRAME_COUNTS",
+        all(
+            len(getattr(controller.frames, name)) == count
+            for name, count in module.FRAME_COUNTS.items()
+        ),
+    )
+
+    bad_frames_path = TEMP_DIR / "bad_frames.json"
+    bad_frames_path.write_text(
+        json.dumps(
+            {
+                "eye_open": [["11110000"] * 8],
+                "eye_blink": "nope",
+                "nose": [["1111", "2", 3] + ["00000000"] * 5],
+                "mouth": [["10000000"] * 8] * 5,
+                "tail": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        bad = module.Max7219FaceController(
+            config_path=write_config("matrix_config.txt", GOOD_CONFIG_BODY),
+            use_status_screen=False,
+            frames_path=bad_frames_path,
+        )
+        bad.render_face(blink=True, mouth_step=1)
+
+    output = buffer.getvalue()
+    recorder.check(
+        "malformed frames warn per problem", output.count("Warning:") == 7, output
+    )
+    recorder.check("warnings name the file", "bad_frames.json" in output)
+    recorder.check(
+        "short feature padded with a blank frame",
+        bad.frames.eye_open[1] == [0] * 8,
+    )
+    recorder.check(
+        "wrong-type feature is blank", bad.frames.eye_blink == [[0] * 8, [0] * 8]
+    )
+    recorder.check("bad rows are blanked", bad.frames.nose[0][:3] == [0, 0, 0])
+    recorder.check("extra frames are trimmed", len(bad.frames.mouth) == 4)
+
+    broken_path = TEMP_DIR / "broken_frames.json"
+    broken_path.write_text('{\n  "eye_open": [\n    [,]\n', encoding="utf-8")
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        broken = module.Max7219FaceController(
+            config_path=write_config("matrix_config.txt", GOOD_CONFIG_BODY),
+            use_status_screen=False,
+            frames_path=broken_path,
+        )
+
+    output = buffer.getvalue()
+    recorder.check(
+        "invalid JSON names the line", "broken_frames.json line 3" in output, output
+    )
+    recorder.check("invalid JSON blanks the face", broken.frames.nose == [[0] * 8])
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        missing = module.Max7219FaceController(
+            config_path=write_config("matrix_config.txt", GOOD_CONFIG_BODY),
+            use_status_screen=False,
+            frames_path=TEMP_DIR / "no_such_frames.json",
+        )
+        missing.redraw()
+
+    recorder.check(
+        "missing frames file warns once",
+        buffer.getvalue().count("Warning:") == 1,
+        buffer.getvalue().strip(),
+    )
+
+
 # Contract: Run every check group and return the exit code for the process.
 def main() -> int:
     recorder = CheckRecorder()
@@ -617,6 +723,7 @@ def main() -> int:
     check_screen_failures(recorder)
     check_shutdown(recorder)
     check_face_rendering(recorder)
+    check_frames_file(recorder)
     return recorder.summary()
 
 
