@@ -85,7 +85,7 @@ function ConsoleCard(props) {
   return (
     <main className="card">
       <header>
-        <h1>PROTOPI CONSOLE</h1>
+        <h1>CONSOLE</h1>
         <ConsoleStatus session={session} />
         <button type="button" onClick={signOut}>
           Sign out

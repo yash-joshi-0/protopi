@@ -220,3 +220,4 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 chat.db
+chat_images/
