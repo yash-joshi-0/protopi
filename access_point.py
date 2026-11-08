@@ -2,6 +2,8 @@
 ADMIN_USERNAME = "protogen"
 ADMIN_PASSWORD = "change-me-before-use"
 
+import base64
+import binascii
 import hmac
 import ipaddress
 import json
@@ -45,6 +47,8 @@ CONSOLE_SHELL = "/bin/bash"
 CHAT_HISTORY_LIMIT = 100
 MAXIMUM_USERNAME_LENGTH = 32
 MAXIMUM_MESSAGE_LENGTH = 500
+MAXIMUM_IMAGE_BYTES = 1048576
+CHAT_IMAGE_LIMIT = 200
 
 # Constants: These should not need to be changed.
 CONNECTION_NAME = "protopi-ap"
@@ -57,36 +61,67 @@ MAXIMUM_PASSPHRASE_LENGTH = 63
 MINIMUM_SSID_LENGTH = 1
 MAXIMUM_SSID_LENGTH = 32
 MAXIMUM_REQUEST_BYTES = 65536
+MAXIMUM_CHAT_REQUEST_BYTES = MAXIMUM_REQUEST_BYTES + (MAXIMUM_IMAGE_BYTES + 2) // 3 * 4
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 WEB_INDEX_NAME = "index.html"
 WEB_VENDOR_NAME = "vendor"
 APP_ROUTES = ("/", "/admin")
 CHAT_DATABASE_PATH = Path(__file__).resolve().parent / "chat.db"
 CHAT_DATABASE_TIMEOUT_MS = 5000
+CHAT_IMAGE_DIRECTORY_NAME = "chat_images"
+CHAT_IMAGE_ROUTE = "/chat-images/"
+CHAT_IMAGE_TOKEN_BYTES = 16
+CHAT_IMAGE_SUFFIXES = (".jpg", ".png", ".gif", ".webp")
+HEX_DIGITS = "0123456789abcdef"
+IMAGE_SIGNATURES = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+WEBP_CONTAINER_TAG = b"RIFF"
+WEBP_FORMAT_TAG = b"WEBP"
+WEBP_SUFFIX = ".webp"
+IMAGE_COLUMN_NAME = "image_name"
 CREATE_MESSAGES_TABLE = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL,
     body TEXT NOT NULL,
-    sent_at_ms INTEGER NOT NULL
+    sent_at_ms INTEGER NOT NULL,
+    image_name TEXT
 )
 """
-INSERT_MESSAGE = "INSERT INTO messages (username, body, sent_at_ms) VALUES (?, ?, ?)"
-SELECT_RECENT_MESSAGES = (
-    "SELECT id, username, body, sent_at_ms FROM messages ORDER BY id DESC LIMIT ?"
+LIST_MESSAGE_COLUMNS = "PRAGMA table_info(messages)"
+ADD_IMAGE_COLUMN = "ALTER TABLE messages ADD COLUMN image_name TEXT"
+INSERT_MESSAGE = (
+    "INSERT INTO messages (username, body, sent_at_ms, image_name) VALUES (?, ?, ?, ?)"
 )
+SELECT_RECENT_MESSAGES = (
+    "SELECT id, username, body, sent_at_ms, image_name FROM messages "
+    "ORDER BY id DESC LIMIT ?"
+)
+SELECT_EXPIRED_IMAGES = (
+    "SELECT id, image_name FROM messages WHERE image_name IS NOT NULL "
+    "ORDER BY id DESC LIMIT -1 OFFSET ?"
+)
+CLEAR_MESSAGE_IMAGE = "UPDATE messages SET image_name = NULL WHERE id = ?"
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 WEB_CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
+    ".gif": "image/gif",
     ".html": "text/html; charset=utf-8",
+    ".jpg": "image/jpeg",
     ".js": "text/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
     ".jsx": "text/jsx; charset=utf-8",
     ".png": "image/png",
     ".svg": "image/svg+xml",
+    ".webp": "image/webp",
 }
 NO_STORE_CACHE_CONTROL = "no-store"
 VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable"
+CHAT_IMAGE_CACHE_CONTROL = "private, max-age=31536000, immutable"
 PROTECTED_MANAGEMENT_FRAMES_DISABLED = "1"
 UNSET_REGULATORY_DOMAIN = "country 00:"
 TWO_GHZ_CHANNELS = range(1, 15)
@@ -160,6 +195,12 @@ def validate_settings() -> None:
     if not 1 <= CONSOLE_PORT <= 65535:
         raise SettingsError("CONSOLE_PORT must be between 1 and 65535.")
 
+    if MAXIMUM_IMAGE_BYTES < 1:
+        raise SettingsError("MAXIMUM_IMAGE_BYTES must be at least 1.")
+
+    if CHAT_IMAGE_LIMIT < 1:
+        raise SettingsError("CHAT_IMAGE_LIMIT must be at least 1.")
+
     if not (WEB_ROOT / WEB_INDEX_NAME).is_file():
         raise SettingsError(f"The console page is missing from {WEB_ROOT}.")
 
@@ -169,10 +210,17 @@ def validate_settings() -> None:
 
 # Class: ChatStore keeps the chat messages in a SQLite file beside the script.
 class ChatStore:
-    # Contract: Remember where the database lives and create its table if needed.
-    def __init__(self, database_path: Path = CHAT_DATABASE_PATH) -> None:
+    # Contract: Remember where the database and images live and create both if needed.
+    def __init__(
+        self,
+        database_path: Path = CHAT_DATABASE_PATH,
+        image_limit: int = CHAT_IMAGE_LIMIT,
+    ) -> None:
         self.database_path = database_path
+        self.image_directory = database_path.parent / CHAT_IMAGE_DIRECTORY_NAME
+        self.image_limit = image_limit
         self.write_lock = threading.Lock()
+        self.image_directory.mkdir(exist_ok=True)
         self.create_table()
 
     # Contract: Open a connection for the calling thread.
@@ -183,37 +231,72 @@ class ChatStore:
         connection.row_factory = sqlite3.Row
         return connection
 
-    # Contract: Create the message table when the database file is new.
+    # Contract: Create the message table, adding the image column to an older file.
     def create_table(self) -> None:
         connection = self.connect()
 
         try:
             with connection:
                 connection.execute(CREATE_MESSAGES_TABLE)
+                columns = connection.execute(LIST_MESSAGE_COLUMNS).fetchall()
+                column_names = [column["name"] for column in columns]
+
+                if IMAGE_COLUMN_NAME not in column_names:
+                    connection.execute(ADD_IMAGE_COLUMN)
         finally:
             connection.close()
 
-    # Contract: Store one message and return it the way the page shows it.
-    def add_message(self, username: str, body: str) -> dict:
+    # Contract: Store one message and its optional image, then drop the oldest images.
+    def add_message(
+        self,
+        username: str,
+        body: str,
+        image_bytes: bytes | None = None,
+        image_suffix: str = "",
+    ) -> dict:
         sent_at_ms = int(time.time() * 1000)
+        image_name = None
+        expired = []
+
+        if image_bytes is not None:
+            image_name = secrets.token_hex(CHAT_IMAGE_TOKEN_BYTES) + image_suffix
+            (self.image_directory / image_name).write_bytes(image_bytes)
+
         connection = self.connect()
 
         try:
             with self.write_lock:
                 with connection:
                     cursor = connection.execute(
-                        INSERT_MESSAGE, (username, body, sent_at_ms)
+                        INSERT_MESSAGE, (username, body, sent_at_ms, image_name)
                     )
                     message_id = cursor.lastrowid
+                    expired = connection.execute(
+                        SELECT_EXPIRED_IMAGES, (self.image_limit,)
+                    ).fetchall()
+                    connection.executemany(
+                        CLEAR_MESSAGE_IMAGE, [(row["id"],) for row in expired]
+                    )
+        except sqlite3.Error:
+            if image_name is not None:
+                self.delete_image(image_name)
+
+            raise
         finally:
             connection.close()
 
-        return {
-            "id": message_id,
-            "username": username,
-            "body": body,
-            "sent_at_ms": sent_at_ms,
-        }
+        for row in expired:
+            self.delete_image(row["image_name"])
+
+        return message_payload(
+            {
+                "id": message_id,
+                "username": username,
+                "body": body,
+                "sent_at_ms": sent_at_ms,
+                "image_name": image_name,
+            }
+        )
 
     # Contract: Return the newest messages, oldest first, as the page reads them.
     def recent_messages(self, limit: int = CHAT_HISTORY_LIMIT) -> List[dict]:
@@ -224,7 +307,58 @@ class ChatStore:
         finally:
             connection.close()
 
-        return [dict(row) for row in reversed(rows)]
+        return [message_payload(dict(row)) for row in reversed(rows)]
+
+    # Contract: Remove one stored image file, reporting a file that will not go.
+    def delete_image(self, image_name: str) -> None:
+        try:
+            (self.image_directory / image_name).unlink(missing_ok=True)
+        except OSError as error:
+            print(f"Warning: could not delete chat image {image_name} ({error}).")
+
+    # Contract: Return the stored image a request names, or None for any other name.
+    def image_path(self, image_name: str) -> Path | None:
+        stem, _, suffix = image_name.partition(".")
+
+        if len(stem) != CHAT_IMAGE_TOKEN_BYTES * 2:
+            return None
+
+        if not all(character in HEX_DIGITS for character in stem):
+            return None
+
+        if f".{suffix}" not in CHAT_IMAGE_SUFFIXES:
+            return None
+
+        candidate = self.image_directory / image_name
+        return candidate if candidate.is_file() else None
+
+
+# Contract: Shape one stored message row the way the page reads it.
+def message_payload(row: dict) -> dict:
+    image_url = None
+
+    if row.get("image_name"):
+        image_url = CHAT_IMAGE_ROUTE + row["image_name"]
+
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "body": row["body"],
+        "sent_at_ms": row["sent_at_ms"],
+        "image_url": image_url,
+    }
+
+
+# Contract: Return the file suffix an image's leading bytes prove, or None.
+def detect_image_suffix(data: bytes) -> str | None:
+    for signature, suffix in IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return suffix
+
+    if data[:4] == WEBP_CONTAINER_TAG and data[8:12] == WEBP_FORMAT_TAG:
+        return WEBP_SUFFIX
+
+    return None
 
 
 # Class: AccessPointController drives the NetworkManager hotspot on the Pi.
@@ -817,8 +951,8 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         morsel = cookie.get(SESSION_COOKIE_NAME)
         return morsel.value if morsel is not None else None
 
-    # Contract: Read the request body, refusing anything larger than the size cap.
-    def read_body(self) -> bytes:
+    # Contract: Read the request body, refusing anything larger than the given cap.
+    def read_body(self, maximum_bytes: int = MAXIMUM_REQUEST_BYTES) -> bytes:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -828,7 +962,7 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return b""
 
-        if length > MAXIMUM_REQUEST_BYTES:
+        if length > maximum_bytes:
             print(f"Warning: discarding an oversized {length} byte request body.")
             self.close_connection = True
             return b""
@@ -875,6 +1009,10 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     def send_not_found(self) -> None:
         self.send_body(b"Not found", HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8")
 
+    # Contract: Tell the page why its request was refused.
+    def send_refusal(self, reason: str) -> None:
+        self.send_json({"error": reason}, HTTPStatus.BAD_REQUEST)
+
     # Contract: Parse the body read for this request, or None when unreadable.
     def read_json_body(self) -> dict | None:
         try:
@@ -909,6 +1047,10 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             self.handle_read_messages()
             return
 
+        if path.startswith(CHAT_IMAGE_ROUTE):
+            self.send_chat_image(path[len(CHAT_IMAGE_ROUTE) :])
+            return
+
         if path in APP_ROUTES:
             self.send_web_file(f"/{WEB_INDEX_NAME}")
             return
@@ -932,6 +1074,7 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 "messages": messages,
                 "maximum_username_length": MAXIMUM_USERNAME_LENGTH,
                 "maximum_message_length": MAXIMUM_MESSAGE_LENGTH,
+                "maximum_image_bytes": MAXIMUM_IMAGE_BYTES,
             }
         )
 
@@ -940,36 +1083,58 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         request = self.read_json_body()
 
         if request is None:
-            self.send_json({"error": "Malformed request."}, HTTPStatus.BAD_REQUEST)
+            self.send_refusal("Malformed request.")
             return
 
         username = str(request.get("username", "")).strip()
         body = str(request.get("body", "")).strip()
+        encoded_image = request.get("image")
+        image_bytes = None
+        image_suffix = ""
 
-        if not username or not body:
-            self.send_json(
-                {"error": "A username and a message are both needed."},
-                HTTPStatus.BAD_REQUEST,
-            )
+        if not username:
+            self.send_refusal("A username is needed.")
             return
 
         if len(username) > MAXIMUM_USERNAME_LENGTH:
-            self.send_json(
-                {"error": f"Keep the username under {MAXIMUM_USERNAME_LENGTH}."},
-                HTTPStatus.BAD_REQUEST,
-            )
+            self.send_refusal(f"Keep the username under {MAXIMUM_USERNAME_LENGTH}.")
             return
 
         if len(body) > MAXIMUM_MESSAGE_LENGTH:
-            self.send_json(
-                {"error": f"Keep the message under {MAXIMUM_MESSAGE_LENGTH}."},
-                HTTPStatus.BAD_REQUEST,
-            )
+            self.send_refusal(f"Keep the message under {MAXIMUM_MESSAGE_LENGTH}.")
+            return
+
+        if encoded_image is not None:
+            if not isinstance(encoded_image, str):
+                self.send_refusal("The image could not be read.")
+                return
+
+            try:
+                image_bytes = base64.b64decode(encoded_image, validate=True)
+            except (binascii.Error, ValueError):
+                self.send_refusal("The image could not be read.")
+                return
+
+            if len(image_bytes) > MAXIMUM_IMAGE_BYTES:
+                kilobytes = MAXIMUM_IMAGE_BYTES // 1024
+                self.send_refusal(f"Keep images under {kilobytes} KB.")
+                return
+
+            image_suffix = detect_image_suffix(image_bytes)
+
+            if image_suffix is None:
+                self.send_refusal("Only JPEG, PNG, GIF, and WebP images are accepted.")
+                return
+
+        if not body and image_bytes is None:
+            self.send_refusal("Write a message or attach an image.")
             return
 
         try:
-            message = self.server.chat_store.add_message(username, body)
-        except sqlite3.Error as error:
+            message = self.server.chat_store.add_message(
+                username, body, image_bytes, image_suffix
+            )
+        except (sqlite3.Error, OSError) as error:
             print(f"Warning: could not store a chat message ({error}).")
             self.send_json(
                 {"error": "The message could not be saved."},
@@ -977,8 +1142,31 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        print(f"{self.remote_address} chat from {username}.")
+        attachment = " with an image" if image_bytes is not None else ""
+        print(f"{self.remote_address} chat from {username}{attachment}.")
         self.send_json({"message": message}, HTTPStatus.CREATED)
+
+    # Contract: Serve one uploaded chat image, or 404 for any name it did not store.
+    def send_chat_image(self, image_name: str) -> None:
+        target = self.server.chat_store.image_path(image_name)
+
+        if target is None:
+            self.send_not_found()
+            return
+
+        try:
+            body = target.read_bytes()
+        except OSError as error:
+            print(f"Warning: could not read chat image {target.name} ({error}).")
+            self.send_not_found()
+            return
+
+        self.send_body(
+            body,
+            HTTPStatus.OK,
+            content_type_for(target),
+            cache_control=CHAT_IMAGE_CACHE_CONTROL,
+        )
 
     # Contract: Serve one file from the web directory, or 404 when it is not there.
     def send_web_file(self, path: str) -> None:
@@ -1005,7 +1193,11 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     # Contract: Route the login, logout, and command endpoints.
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        self.request_body = self.read_body()
+
+        if path == "/api/messages":
+            self.request_body = self.read_body(MAXIMUM_CHAT_REQUEST_BYTES)
+        else:
+            self.request_body = self.read_body()
 
         if path == "/login":
             self.handle_login()
@@ -1166,7 +1358,7 @@ def main() -> None:
 
     try:
         chat_store = ChatStore()
-    except sqlite3.Error as error:
+    except (sqlite3.Error, OSError) as error:
         print(f"Cannot start: the chat database could not be opened ({error}).")
         return
 

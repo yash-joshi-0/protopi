@@ -324,3 +324,107 @@ header a.meta:focus-visible {
   flex: 1;
   margin-top: 0;
 }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.chat-send .chat-attach {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  color: var(--accent);
+  border: 1px solid var(--accent-deep);
+  border-radius: 6px;
+  font-size: inherit;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.chat-send .chat-attach:hover {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+}
+
+.visually-hidden:focus-visible + .chat-attach {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
+.chat-attachment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  padding: 0.35rem 0.35rem 0.35rem 0.7rem;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+}
+
+.chat-attachment .meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-attachment button {
+  flex-shrink: 0;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.chat-image {
+  position: relative;
+  display: block;
+  width: min(100%, 18rem);
+  aspect-ratio: 4 / 3;
+  margin-top: 0.4rem;
+  padding: 0;
+  overflow: hidden;
+  background: var(--inset);
+  border: 1px solid var(--border-strong);
+}
+
+.chat-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  filter: blur(28px) brightness(0.55);
+  transform: scale(1.2);
+  transition:
+    filter 150ms ease,
+    transform 150ms ease;
+}
+
+.chat-image.revealed img {
+  object-fit: contain;
+  filter: none;
+  transform: none;
+}
+
+.chat-image-veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}

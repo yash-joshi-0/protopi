@@ -245,11 +245,20 @@ CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL,
     body TEXT NOT NULL,
-    sent_at_ms INTEGER NOT NULL
+    sent_at_ms INTEGER NOT NULL,
+    image_name TEXT
 )
 ```
 
-The page asks for the newest `CHAT_HISTORY_LIMIT` messages and the server refuses a message longer than `MAXIMUM_MESSAGE_LENGTH` or a name longer than `MAXIMUM_USERNAME_LENGTH`; all three are under `# Configuration values:`. Delete `chat.db` to clear the history.
+The page asks for the newest `CHAT_HISTORY_LIMIT` messages and the server refuses a message longer than `MAXIMUM_MESSAGE_LENGTH` or a name longer than `MAXIMUM_USERNAME_LENGTH`; all three are under `# Configuration values:`. Delete `chat.db` and the `chat_images` folder to clear the history.
+
+#### Images
+
+The **Image** button beside the message box attaches a picture, with or without text. Before sending, the browser shrinks it to at most 1600 pixels on its longest side and re-saves it as a JPEG. That keeps uploads small over the hotspot and strips the location and camera details phones store in photos. Animated GIFs arrive as a still frame.
+
+Every picture arrives heavily blurred behind a "Click to show" label. Clicking it shows the picture and clicking again blurs it back. Each viewer reveals images for themselves; nobody else's screen changes.
+
+The server checks the file's first bytes and only stores JPEG, PNG, GIF, and WebP, up to `MAXIMUM_IMAGE_BYTES`. Files go in `chat_images/` beside `chat.db` (ignored by git) under random names, and are served at `/chat-images/<name>`. Only the newest `CHAT_IMAGE_LIMIT` images are kept, so an open chat cannot fill the SD card: older messages keep their text and lose their picture. Both settings are under `# Configuration values:`. A `chat.db` from before images gains the `image_name` column on its own the next time the script starts.
 
 The chat is unauthenticated, so there is no way to stop anyone from sending anything, but it is covered to prevent SQL injection and the like.
 
@@ -267,8 +276,9 @@ web/
 ├── components/
 │   ├── App.jsx                    routes on the address bar: /admin or the chat
 │   ├── ChatPage.jsx               the main screen, holds the messages and polls
-│   ├── ChatForm.jsx               name and message boxes, remembers the name
-│   ├── MessageList.jsx            the stored messages with their times
+│   ├── ChatForm.jsx               name, message, and image picker; shrinks images before sending
+│   ├── ChatImage.jsx              a chat picture, blurred until clicked
+│   ├── MessageList.jsx            the stored messages with their times and pictures
 │   ├── AdminPage.jsx              login card until signed in, then the console
 │   ├── LoginCard.jsx              username, password, error message
 │   ├── ConsoleCard.jsx            owns the transcript and runs commands
@@ -280,7 +290,7 @@ web/
 
 There is no build step. Babel compiles the JSX in the browser, so all edits are live and update on reload.
 
-`access_point.py` serves that directory as static files, serves the page itself for `/` and `/admin`, and answers `/api/messages`, `/api/session`, `/login`, `/logout`, and `/run` as JSON.
+`access_point.py` serves that directory as static files, serves the page itself for `/` and `/admin`, serves uploaded pictures from `/chat-images/`, and answers `/api/messages`, `/api/session`, `/login`, `/logout`, and `/run` as JSON.
 
 Components are plain `function` declarations loaded as ordinary scripts, not ES modules, so there are no imports between them. A new component needs a `<script type="text/babel">` line in `index.html`, listed before whatever uses it.
 

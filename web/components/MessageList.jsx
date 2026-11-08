@@ -1,6 +1,9 @@
 // Component: MessageList shows the stored chat messages, oldest first.
 function MessageList(props) {
   const paneRef = React.useRef(null);
+  const newestId = props.messages.length
+    ? props.messages[props.messages.length - 1].id
+    : null;
 
   React.useEffect(() => {
     const pane = paneRef.current;
@@ -8,7 +11,7 @@ function MessageList(props) {
     if (pane) {
       pane.scrollTop = pane.scrollHeight;
     }
-  }, [props.messages]);
+  }, [newestId]);
 
   if (props.messages.length === 0) {
     return (
@@ -26,7 +29,8 @@ function MessageList(props) {
             <span className="message-username">{message.username}</span>
             <time className="meta">{formatSentAt(message.sent_at_ms)}</time>
           </header>
-          <p className="message-body">{message.body}</p>
+          {message.body ? <p className="message-body">{message.body}</p> : null}
+          {message.image_url ? <ChatImage src={message.image_url} /> : null}
         </article>
       ))}
     </div>
