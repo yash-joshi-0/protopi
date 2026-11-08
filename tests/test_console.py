@@ -3,12 +3,14 @@
 # Run from the repository root: python tests/test_console.py
 from __future__ import annotations
 
+import base64
 import http.client
 import io
 import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -27,12 +29,14 @@ TEST_PASSWORD = "change-me-before-use"
 WEB_FILES = [
     "/index.html",
     "/console.css",
+    "/logo.png",
     "/api.js",
     "/main.jsx",
     "/components/App.jsx",
     "/components/AdminPage.jsx",
     "/components/ChatForm.jsx",
     "/components/ChatPage.jsx",
+    "/components/ChatImage.jsx",
     "/components/MessageList.jsx",
     "/components/LoginCard.jsx",
     "/components/ConsoleCard.jsx",
@@ -48,6 +52,7 @@ COMPONENT_NAMES = [
     "AdminPage",
     "App",
     "ChatForm",
+    "ChatImage",
     "ChatPage",
     "ConsoleCard",
     "ConsoleStatus",
@@ -73,6 +78,24 @@ BROWSER_CANDIDATES = [
     "chromium-browser",
     "google-chrome",
 ]
+PNG_IMAGE = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+JPEG_IMAGE = b"\xff\xd8\xff\xe0" + b"\x00" * 24
+UNSAFE_IMAGE_PATHS = [
+    "/chat-images/../chat.db",
+    "/chat-images/..%2Fchat.db",
+    "/chat-images/abc.png",
+    "/chat-images/" + "0" * 32 + ".svg",
+    "/chat-images/" + "g" * 32 + ".png",
+    "/chat-images/" + "0" * 32 + ".png.html",
+]
+OLD_MESSAGES_TABLE = """
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    body TEXT NOT NULL,
+    sent_at_ms INTEGER NOT NULL
+)
+"""
 BROWSER_TIMEOUT_MS = 60000
 BROWSER_VIRTUAL_TIME_MS = 20000
 SHORT_COMMAND_TIMEOUT_MS = 1500
@@ -260,7 +283,7 @@ def find_browser() -> str | None:
 
 # Contract: Check the shipped web directory holds every file the page asks for.
 def check_web_files_present(recorder: CheckRecorder) -> None:
-    for name in ["index.html", "console.css", "api.js", "main.jsx"]:
+    for name in ["index.html", "console.css", "logo.png", "api.js", "main.jsx"]:
         target = access_point.WEB_ROOT / name
         recorder.check(f"web/{name} exists", target.is_file())
 
@@ -270,6 +293,7 @@ def check_web_files_present(recorder: CheckRecorder) -> None:
 
     index = (access_point.WEB_ROOT / "index.html").read_text(encoding="utf-8")
     recorder.check("index.html loads the stylesheet", 'href="/console.css"' in index)
+    recorder.check("index.html sets the tab icon", 'href="/logo.png"' in index)
     recorder.check("index.html loads the api helpers", 'src="/api.js"' in index)
     recorder.check("index.html loads React", "react.production.min.js" in index)
     recorder.check("index.html loads ReactDOM", "react-dom.production.min.js" in index)
@@ -721,6 +745,13 @@ def check_static_serving(recorder: CheckRecorder) -> None:
             headers.get("Content-Type", ""),
         )
 
+        status, headers, _ = client.request("/logo.png")
+        recorder.check(
+            "png has its own content type",
+            headers.get("Content-Type", "") == "image/png",
+            headers.get("Content-Type", ""),
+        )
+
         status, headers, _ = client.request("/api.js")
         recorder.check(
             "js has its own content type",
@@ -1023,6 +1054,146 @@ def check_chat_api(recorder: CheckRecorder) -> None:
     )
 
 
+# Contract: Encode image bytes the way the chat page sends them.
+def encode_image(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+# Contract: Check chat images are stored, served, refused when bad, and pruned.
+def check_chat_images(recorder: CheckRecorder) -> None:
+    database = Path(tempfile.mkdtemp()) / "chat.db"
+    store = access_point.ChatStore(database)
+    server, client = start_console(chat_store=store)
+
+    try:
+        status, payload, _ = client.json_request("/api/messages")
+        recorder.check(
+            "chat reports the image size limit",
+            payload.get("maximum_image_bytes") == access_point.MAXIMUM_IMAGE_BYTES,
+        )
+
+        status, payload, _ = client.json_request(
+            "/api/messages",
+            {"username": "Kade", "body": "look", "image": encode_image(PNG_IMAGE)},
+        )
+        recorder.check(
+            "an image message is accepted", status == HTTPStatus.CREATED, f"{status}"
+        )
+        image_url = payload.get("message", {}).get("image_url") or ""
+        recorder.check(
+            "the image message links its picture",
+            image_url.startswith(access_point.CHAT_IMAGE_ROUTE)
+            and image_url.endswith(".png"),
+            image_url,
+        )
+
+        status, headers, body = client.request(image_url)
+        recorder.check("the picture is served", status == HTTPStatus.OK, f"{status}")
+        recorder.check("the picture is unchanged", body == PNG_IMAGE)
+        recorder.check(
+            "the picture has an image content type",
+            headers.get("Content-Type", "") == "image/png",
+            headers.get("Content-Type", ""),
+        )
+        recorder.check(
+            "the picture is not sniffed",
+            headers.get("X-Content-Type-Options", "") == "nosniff",
+        )
+
+        status, payload, _ = client.json_request(
+            "/api/messages",
+            {"username": "Vex", "body": "", "image": encode_image(JPEG_IMAGE)},
+        )
+        recorder.check(
+            "an image needs no text", status == HTTPStatus.CREATED, f"{status}"
+        )
+        recorder.check(
+            "a jpeg keeps its type",
+            (payload.get("message", {}).get("image_url") or "").endswith(".jpg"),
+        )
+
+        status, payload, _ = client.json_request("/api/messages")
+        stored = payload.get("messages", [])
+        recorder.check(
+            "the history carries image links",
+            [bool(item.get("image_url")) for item in stored] == [True, True],
+        )
+
+        oversized_image = PNG_IMAGE + b"\x00" * access_point.MAXIMUM_IMAGE_BYTES
+        refusals = {
+            "a file that is not an image is refused": encode_image(b"hello there"),
+            "an svg is refused": encode_image(b"<svg xmlns='x'></svg>"),
+            "unreadable base64 is refused": "not base64 at all!",
+            "a non-text image field is refused": 12,
+            "an oversized image is refused": encode_image(oversized_image),
+        }
+
+        for label, encoded in refusals.items():
+            status, payload, _ = client.json_request(
+                "/api/messages", {"username": "Kade", "body": "x", "image": encoded}
+            )
+            recorder.check(label, status == HTTPStatus.BAD_REQUEST, f"{status}")
+
+        status, payload, _ = client.json_request("/api/messages")
+        recorder.check(
+            "refused images are not stored", len(payload.get("messages", [])) == 2
+        )
+        recorder.check(
+            "refused images leave no files",
+            len(list(store.image_directory.iterdir())) == 2,
+        )
+
+        for path in UNSAFE_IMAGE_PATHS:
+            status, _, _ = client.request(path)
+            recorder.check(
+                f"{path} is not served", status == HTTPStatus.NOT_FOUND, f"{status}"
+            )
+    finally:
+        stop_console(server)
+
+    pruned_store = access_point.ChatStore(
+        Path(tempfile.mkdtemp()) / "chat.db", image_limit=1
+    )
+    first = pruned_store.add_message("Kade", "one", PNG_IMAGE, ".png")
+    second = pruned_store.add_message("Kade", "two", PNG_IMAGE, ".png")
+    first_name = first["image_url"].rsplit("/", 1)[-1]
+    history = pruned_store.recent_messages()
+    recorder.check(
+        "the oldest image is dropped past the limit",
+        not (pruned_store.image_directory / first_name).exists(),
+    )
+    recorder.check(
+        "a dropped image leaves its message",
+        [item["body"] for item in history] == ["one", "two"]
+        and history[0]["image_url"] is None,
+    )
+    recorder.check(
+        "the newest image is kept",
+        history[1]["image_url"] == second["image_url"],
+    )
+
+    old_database = Path(tempfile.mkdtemp()) / "chat.db"
+    connection = sqlite3.connect(old_database)
+
+    with connection:
+        connection.execute(OLD_MESSAGES_TABLE)
+        connection.execute(
+            "INSERT INTO messages (username, body, sent_at_ms) VALUES (?, ?, ?)",
+            ("Vex", "from before images", 1),
+        )
+
+    connection.close()
+    upgraded = access_point.ChatStore(old_database)
+    upgraded.add_message("Kade", "after", PNG_IMAGE, ".png")
+    history = upgraded.recent_messages()
+    recorder.check(
+        "an older chat.db gains images",
+        [item["body"] for item in history] == ["from before images", "after"]
+        and history[0]["image_url"] is None
+        and history[1]["image_url"] is not None,
+    )
+
+
 # Contract: Check the chat and the admin console answer on their own routes.
 def check_page_routes(recorder: CheckRecorder) -> None:
     server, client = start_console()
@@ -1160,7 +1331,7 @@ def check_browser_render(recorder: CheckRecorder) -> None:
 
     try:
         chat_root = extract_root(render_page(browser, f"{client.base}/"))
-        recorder.check("React renders the chat on /", "PROTOPI CHAT" in chat_root)
+        recorder.check("React renders the chat on /", "CHAT" in chat_root)
         recorder.check("the chat shows its form", "chat-form" in chat_root)
         recorder.check(
             "the chat shows a stored message",
@@ -1169,12 +1340,12 @@ def check_browser_render(recorder: CheckRecorder) -> None:
         recorder.check("the chat names the sender", "Vex" in chat_root)
         recorder.check("the chat links to the console", 'href="/admin"' in chat_root)
         recorder.check(
-            "the chat is not the login card", "PROTOPI ADMIN" not in chat_root
+            "the chat is not the login card", "ADMIN" not in chat_root
         )
 
         login_root = extract_root(render_page(browser, f"{client.base}/admin"))
         recorder.check(
-            "React renders the login card on /admin", "PROTOPI ADMIN" in login_root
+            "React renders the login card on /admin", "ADMIN" in login_root
         )
         recorder.check(
             "login card asks for a password", 'type="password"' in login_root
@@ -1183,7 +1354,7 @@ def check_browser_render(recorder: CheckRecorder) -> None:
 
         console_root = extract_root(render_page(browser, f"{client.base}/auto-login"))
         recorder.check(
-            "React renders the console after login", "PROTOPI CONSOLE" in console_root
+            "React renders the console after login", "CONSOLE" in console_root
         )
         recorder.check("console shows a prompt", 'class="prompt"' in console_root)
     finally:
@@ -1276,6 +1447,7 @@ def main() -> int:
     check_session_api(recorder)
     check_command_guards(recorder)
     check_chat_api(recorder)
+    check_chat_images(recorder)
     check_page_routes(recorder)
     check_connection_reuse(recorder)
     check_login_lockout(recorder)

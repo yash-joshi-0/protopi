@@ -3,7 +3,11 @@ const CHAT_POLL_INTERVAL_MS = 4000;
 // Component: ChatPage is the main screen, showing the chat and taking new messages.
 function ChatPage() {
   const [messages, setMessages] = React.useState([]);
-  const [limits, setLimits] = React.useState({ username: 32, body: 500 });
+  const [limits, setLimits] = React.useState({
+    username: 32,
+    body: 500,
+    image: 1048576,
+  });
   const [notice, setNotice] = React.useState("");
   const [loaded, setLoaded] = React.useState(false);
 
@@ -21,6 +25,7 @@ function ChatPage() {
       setLimits({
         username: payload.maximum_username_length,
         body: payload.maximum_message_length,
+        image: payload.maximum_image_bytes,
       });
       setNotice("");
     } catch (error) {
@@ -45,7 +50,7 @@ function ChatPage() {
   return (
     <main className="card chat">
       <header>
-        <h1>PROTOPI CHAT</h1>
+        <h1>CHAT</h1>
         <a className="meta" href="/admin">
           Admin console
         </a>
@@ -62,6 +67,7 @@ function ChatPage() {
       <ChatForm
         maximumUsernameLength={limits.username}
         maximumMessageLength={limits.body}
+        maximumImageBytes={limits.image}
         onSent={handleSent}
         onError={setNotice}
       />

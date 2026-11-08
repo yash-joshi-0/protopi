@@ -31,7 +31,7 @@ function LoginCard(props) {
 
   return (
     <main className="card login">
-      <h1>PROTOPI ADMIN</h1>
+      <h1>ADMIN</h1>
       <p className="meta">{props.session.ssid}</p>
 
       <form onSubmit={submit}>
