@@ -50,6 +50,8 @@ STATUS_SCREEN_RST_PIN = 25
 STATUS_SCREEN_REFRESH_MS = 0
 STATUS_SCREEN_PROBE_INTERVAL_MS = 1000
 STATUS_SCREEN_BUS_SPEED_HZ = 4000000
+STATUS_SCREEN_FLASH_MS = 250
+STATUS_SCREEN_INFO_MS = 5000
 
 # Constants: These should not need to be changed.
 CONFIG_FILE = "matrix_config.txt"
@@ -177,6 +179,8 @@ class Max7219FaceController:
         self.status_last_probe_attempt = 0.0
         self.status_probe_interval_ms = STATUS_SCREEN_PROBE_INTERVAL_MS
         self.status_refresh_ms = STATUS_SCREEN_REFRESH_MS
+        self.status_flash_ms = STATUS_SCREEN_FLASH_MS
+        self.status_info_ms = STATUS_SCREEN_INFO_MS
         self._status_failure_reported = False
 
         if self.use_status_screen and sh1106 is None:
@@ -334,6 +338,49 @@ class Max7219FaceController:
 
         return image
 
+    # Contract: Return the startup info lines shown after the status screen flash.
+    def get_intro_lines(self) -> List[str]:
+        return [
+            f"matrices={self.num_matrices}",
+            f"brightness={self.matrix_brightness}/{MATRIX_BRIGHTNESS_MAX}",
+            f"frames={self.frames_path.name}",
+            f"button=GPIO{self.button_pin}",
+        ]
+
+    # Contract: Show an image on the status screen, dropping the device if it fails.
+    def paint_status_image(self, image: Image.Image) -> bool:
+        try:
+            self.status_device.display(image)
+        except OSError as error:
+            self.report_status_failure(error)
+            self.status_serial = None
+            self.status_device = None
+            self.status_font = None
+            return False
+
+        return True
+
+    # Contract: Flash the status screen white then black, then hold the startup info.
+    def play_status_intro(self) -> None:
+        if self.status_device is None:
+            return
+
+        screen_size = (STATUS_SCREEN_WIDTH, STATUS_SCREEN_HEIGHT)
+        intro_steps = [
+            (Image.new("1", screen_size, 1), self.status_flash_ms),
+            (Image.new("1", screen_size, 0), self.status_flash_ms),
+            (self.render_status_image(self.get_intro_lines()), self.status_info_ms),
+        ]
+
+        for image, hold_ms in intro_steps:
+            if not self.paint_status_image(image):
+                return
+
+            time.sleep(hold_ms / 1000.0)
+
+        self.status_last_update = 0.0
+        self.update_status_screen()
+
     # Contract: Update the attached status screen with the current controller state.
     def update_status_screen(self) -> None:
         if not self.use_status_screen:
@@ -352,16 +399,7 @@ class Max7219FaceController:
             return
 
         self.status_last_update = now
-
-        try:
-            self.status_device.display(
-                self.render_status_image(self.get_status_lines())
-            )
-        except OSError as error:
-            self.report_status_failure(error)
-            self.status_serial = None
-            self.status_device = None
-            self.status_font = None
+        self.paint_status_image(self.render_status_image(self.get_status_lines()))
 
     # Contract: Load per-matrix transforms from disk, skipping unusable lines.
     def load_matrix_config(self) -> None:
@@ -777,8 +815,9 @@ class Max7219FaceController:
             GPIO.cleanup(self.button_pin)
             self._gpio_configured = False
 
-    # Contract: Run calibration and return the next blink time.
+    # Contract: Play the status screen intro, run calibration, return the next blink.
     def start(self) -> float:
+        self.play_status_intro()
         self.configure_matrices()
         self.redraw()
         print("Face initialized.")

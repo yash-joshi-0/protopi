@@ -3,6 +3,7 @@
 # Run from the repository root: python tests/test_screen.py
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import io
 import json
@@ -13,6 +14,8 @@ import types
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+from PIL import Image, ImageDraw
 
 # Constants: These should not need to be changed.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -743,6 +746,96 @@ def check_matrix_brightness(recorder: CheckRecorder) -> None:
         )
 
 
+# Contract: Run start() with a stubbed prompt and sleep, returning the sleeps taken.
+def run_start_quietly(module, controller) -> List[float]:
+    sleeps: List[float] = []
+    real_time = module.time
+    real_input = builtins.input
+    module.time = types.SimpleNamespace(monotonic=time.monotonic, sleep=sleeps.append)
+    builtins.input = lambda prompt="": ""
+
+    try:
+        with redirect_stdout(io.StringIO()):
+            controller.start()
+    finally:
+        module.time = real_time
+        builtins.input = real_input
+
+    return sleeps
+
+
+# Contract: Check the --screen intro flashes white then black, then holds the info.
+def check_status_intro(recorder: CheckRecorder) -> None:
+    hardware = FakeHardware()
+    module = hardware.load_target()
+    recorder.check(
+        "intro timings are 250 ms flash and 5000 ms info",
+        (module.STATUS_SCREEN_FLASH_MS, module.STATUS_SCREEN_INFO_MS) == (250, 5000),
+    )
+
+    controller = build_controller(module, use_status_screen=True)
+    hardware.frames.clear()
+    sleeps = run_start_quietly(module, controller)
+    frames = hardware.frames
+
+    recorder.check(
+        "intro paints at least four frames", len(frames) >= 4, str(len(frames))
+    )
+    recorder.check(
+        "intro starts all white",
+        frames[0].tobytes() == Image.new("1", (128, 64), 1).tobytes(),
+    )
+    recorder.check("then all black", frames[1].getbbox() is None)
+    recorder.check(
+        "then the info lines",
+        frames[2].tobytes()
+        == controller.render_status_image(controller.get_intro_lines()).tobytes(),
+    )
+    recorder.check(
+        "then standard status",
+        frames[3].tobytes()
+        == controller.render_status_image(["face_state=IDLE"]).tobytes(),
+    )
+    recorder.check(
+        "holds 250, 250, then 5000 ms", sleeps == [0.25, 0.25, 5.0], str(sleeps)
+    )
+    recorder.check(
+        "info names matrices, brightness, frames, button",
+        controller.get_intro_lines()
+        == ["matrices=14", "brightness=0/15", "frames=frames.json", "button=GPIO27"],
+        str(controller.get_intro_lines()),
+    )
+
+    measure = ImageDraw.Draw(Image.new("1", (128, 64)))
+    info_box = measure.multiline_textbbox(
+        (0, 0), "\n".join(controller.get_intro_lines()), font=controller.status_font
+    )
+    recorder.check(
+        "info fits on the 128x64 screen",
+        info_box[2] <= 128 and info_box[3] <= 64,
+        str(info_box),
+    )
+
+    face_only = build_controller(module, use_status_screen=False)
+    hardware.frames.clear()
+    sleeps = run_start_quietly(module, face_only)
+    recorder.check(
+        "no intro without --screen", hardware.frames == [] and sleeps == [], str(sleeps)
+    )
+
+    dying = build_controller(module, use_status_screen=True)
+    hardware.spi_mode = "dies"
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        dying.play_status_intro()
+    recorder.check(
+        "screen dying mid-intro is reported once and skipped",
+        dying.status_device is None
+        and buffer.getvalue().count("Warning: no status screen") == 1,
+        buffer.getvalue().strip(),
+    )
+
+
 # Contract: Run every check group and return the exit code for the process.
 def main() -> int:
     recorder = CheckRecorder()
@@ -759,6 +852,7 @@ def main() -> int:
     check_face_rendering(recorder)
     check_frames_file(recorder)
     check_matrix_brightness(recorder)
+    check_status_intro(recorder)
     return recorder.summary()
 
 
