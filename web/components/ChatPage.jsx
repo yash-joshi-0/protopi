@@ -45,7 +45,7 @@ function ChatPage() {
   return (
     <main className="card chat">
       <header>
-        <h1>PROTOPI CHAT</h1>
+        <h1>CHAT</h1>
         <a className="meta" href="/admin">
           Admin console
         </a>

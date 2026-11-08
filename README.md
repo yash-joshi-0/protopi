@@ -261,6 +261,7 @@ Both pages live in [`web/`](web/) as a React app written in JSX, one component p
 web/
 ├── index.html                     loads the stylesheet, the vendor scripts, then each component
 ├── console.css                    every style both pages use
+├── logo.png                       title mark and tab icon
 ├── api.js                         fetch helpers shared by the components
 ├── main.jsx                       mounts <App /> into #root
 ├── components/

@@ -27,6 +27,7 @@ TEST_PASSWORD = "change-me-before-use"
 WEB_FILES = [
     "/index.html",
     "/console.css",
+    "/logo.png",
     "/api.js",
     "/main.jsx",
     "/components/App.jsx",
@@ -260,7 +261,7 @@ def find_browser() -> str | None:
 
 # Contract: Check the shipped web directory holds every file the page asks for.
 def check_web_files_present(recorder: CheckRecorder) -> None:
-    for name in ["index.html", "console.css", "api.js", "main.jsx"]:
+    for name in ["index.html", "console.css", "logo.png", "api.js", "main.jsx"]:
         target = access_point.WEB_ROOT / name
         recorder.check(f"web/{name} exists", target.is_file())
 
@@ -270,6 +271,7 @@ def check_web_files_present(recorder: CheckRecorder) -> None:
 
     index = (access_point.WEB_ROOT / "index.html").read_text(encoding="utf-8")
     recorder.check("index.html loads the stylesheet", 'href="/console.css"' in index)
+    recorder.check("index.html sets the tab icon", 'href="/logo.png"' in index)
     recorder.check("index.html loads the api helpers", 'src="/api.js"' in index)
     recorder.check("index.html loads React", "react.production.min.js" in index)
     recorder.check("index.html loads ReactDOM", "react-dom.production.min.js" in index)
@@ -721,6 +723,13 @@ def check_static_serving(recorder: CheckRecorder) -> None:
             headers.get("Content-Type", ""),
         )
 
+        status, headers, _ = client.request("/logo.png")
+        recorder.check(
+            "png has its own content type",
+            headers.get("Content-Type", "") == "image/png",
+            headers.get("Content-Type", ""),
+        )
+
         status, headers, _ = client.request("/api.js")
         recorder.check(
             "js has its own content type",
@@ -1160,7 +1169,7 @@ def check_browser_render(recorder: CheckRecorder) -> None:
 
     try:
         chat_root = extract_root(render_page(browser, f"{client.base}/"))
-        recorder.check("React renders the chat on /", "PROTOPI CHAT" in chat_root)
+        recorder.check("React renders the chat on /", "CHAT" in chat_root)
         recorder.check("the chat shows its form", "chat-form" in chat_root)
         recorder.check(
             "the chat shows a stored message",
@@ -1169,12 +1178,12 @@ def check_browser_render(recorder: CheckRecorder) -> None:
         recorder.check("the chat names the sender", "Vex" in chat_root)
         recorder.check("the chat links to the console", 'href="/admin"' in chat_root)
         recorder.check(
-            "the chat is not the login card", "PROTOPI ADMIN" not in chat_root
+            "the chat is not the login card", "ADMIN" not in chat_root
         )
 
         login_root = extract_root(render_page(browser, f"{client.base}/admin"))
         recorder.check(
-            "React renders the login card on /admin", "PROTOPI ADMIN" in login_root
+            "React renders the login card on /admin", "ADMIN" in login_root
         )
         recorder.check(
             "login card asks for a password", 'type="password"' in login_root
@@ -1183,7 +1192,7 @@ def check_browser_render(recorder: CheckRecorder) -> None:
 
         console_root = extract_root(render_page(browser, f"{client.base}/auto-login"))
         recorder.check(
-            "React renders the console after login", "PROTOPI CONSOLE" in console_root
+            "React renders the console after login", "CONSOLE" in console_root
         )
         recorder.check("console shows a prompt", 'class="prompt"' in console_root)
     finally:

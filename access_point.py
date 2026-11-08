@@ -82,6 +82,7 @@ WEB_CONTENT_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
     ".jsx": "text/jsx; charset=utf-8",
+    ".png": "image/png",
     ".svg": "image/svg+xml",
 }
 NO_STORE_CACHE_CONTROL = "no-store"
